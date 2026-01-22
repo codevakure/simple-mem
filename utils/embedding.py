@@ -1,28 +1,61 @@
 """
-Embedding utilities - Generate vector embeddings using SentenceTransformers
-Supports Qwen3 Embedding models through SentenceTransformers interface
+Embedding utilities - Unified embedding interface
+
+Supports multiple backends:
+- Local: SentenceTransformers (Qwen3, etc.) - default
+- Bedrock: Amazon Titan Embeddings V2
+
+The backend is selected based on config.ENDPOINT
 """
 from typing import List, Optional, Dict, Any
 import numpy as np
-import config
 import os
 
 
 class EmbeddingModel:
     """
-    Embedding model using SentenceTransformers (supports Qwen3 and other models)
+    Unified Embedding model supporting local and Bedrock backends
     """
     def __init__(self, model_name: str = None, use_optimization: bool = True):
-        self.model_name = model_name or config.EMBEDDING_MODEL
+        import config
+        
+        self.endpoint = getattr(config, 'ENDPOINT', 'openai').lower()
+        
+        if self.endpoint == 'bedrock':
+            self._init_bedrock(config)
+        else:
+            self._init_local(model_name, use_optimization, config)
+    
+    def _init_bedrock(self, config):
+        """Initialize AWS Bedrock Titan Embeddings"""
+        import boto3
+        
+        self.model_id = getattr(config, 'BEDROCK_EMBEDDING_MODEL', 'amazon.titan-embed-text-v2:0')
+        self.region_name = getattr(config, 'AWS_REGION', 'us-east-1')
+        self.dimension = getattr(config, 'EMBEDDING_DIMENSION', 1024)
+        self.model_type = "bedrock"
+        
+        self.bedrock_runtime = boto3.client(
+            service_name='bedrock-runtime',
+            region_name=self.region_name
+        )
+        
+        print(f"Initialized Bedrock Titan V2: {self.model_id} ({self.dimension}d) in {self.region_name}")
+    
+    def _init_local(self, model_name: str, use_optimization: bool, config):
+        """Initialize local SentenceTransformers model"""
+        self.model_name = model_name or getattr(config, 'EMBEDDING_MODEL', 'Qwen/Qwen3-Embedding-0.6B')
         self.use_optimization = use_optimization
         
         print(f"Loading embedding model: {self.model_name}")
         
         # Check if it's a Qwen3 model (through SentenceTransformers)
-        if self.model_name.startswith("qwen3"):
+        if self.model_name.startswith("qwen3") or self.model_name.lower().startswith("qwen"):
             self._init_qwen3_sentence_transformer()
         else:
             self._init_standard_sentence_transformer()
+        
+        self.model_type = "local"
 
     def _init_qwen3_sentence_transformer(self):
         """Initialize Qwen3 model using SentenceTransformers"""
@@ -100,16 +133,60 @@ class EmbeddingModel:
         
         Args:
         - texts: List of texts to encode
-        - is_query: Whether these are query texts (for Qwen3 prompt optimization)
+        - is_query: Whether these are query texts (for asymmetric retrieval optimization)
         """
         if isinstance(texts, str):
             texts = [texts]
         
+        # Use Bedrock if endpoint is bedrock
+        if self.model_type == "bedrock":
+            return self._encode_bedrock(texts, is_query=is_query)
+        
         # Use query prompt for Qwen3 models when encoding queries
-        if self.model_type == "qwen3_sentence_transformer" and self.supports_query_prompt and is_query:
+        if self.model_type == "local" and hasattr(self, 'supports_query_prompt') and self.supports_query_prompt and is_query:
             return self._encode_with_query_prompt(texts)
         else:
             return self._encode_standard(texts)
+    
+    def _encode_bedrock(self, texts: List[str], is_query: bool = False) -> np.ndarray:
+        """
+        Encode texts using AWS Bedrock Titan V2
+        
+        Mimics Qwen3's asymmetric retrieval behavior:
+        - Queries get an instruction prefix (like Qwen3's prompt_name="query")
+        - Documents are encoded as-is
+        
+        This matches the legacy SimpleMem pattern where queries and documents
+        are encoded differently for optimal retrieval performance.
+        """
+        import json
+        
+        embeddings = []
+        
+        # Asymmetric encoding: Add query instruction prefix (like Qwen3's query prompt)
+        # Qwen3 uses: "Instruct: Given a query, retrieve relevant passages\nQuery: "
+        # We use a similar pattern for Titan V2
+        if is_query:
+            texts = [f"Represent this query for retrieving relevant documents: {t}" for t in texts]
+        
+        for text in texts:
+            body = json.dumps({
+                "inputText": text,
+                "dimensions": self.dimension,
+                "normalize": True
+            })
+            
+            response = self.bedrock_runtime.invoke_model(
+                modelId=self.model_id,
+                body=body,
+                contentType='application/json',
+                accept='application/json'
+            )
+            
+            response_body = json.loads(response['body'].read())
+            embeddings.append(response_body.get('embedding'))
+        
+        return np.array(embeddings, dtype=np.float32)
 
     def encode_single(self, text: str, is_query: bool = False) -> np.ndarray:
         """

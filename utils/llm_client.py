@@ -1,15 +1,20 @@
 """
-LLM Client - Handles all LLM interactions
+LLM Client - Unified interface for LLM interactions
+
+Supports multiple backends:
+- OpenAI: OpenAI-compatible API (OpenAI, Qwen DashScope, Azure, etc.)
+- Bedrock: Amazon Nova, Claude via AWS Bedrock
+
+The backend is selected based on config.ENDPOINT
 """
 import json
 from typing import List, Dict, Any, Optional
-from openai import OpenAI
-import config
+import os
 
 
 class LLMClient:
     """
-    Unified LLM client interface
+    Unified LLM client interface supporting OpenAI and Bedrock
     """
     def __init__(
         self,
@@ -19,6 +24,41 @@ class LLMClient:
         enable_thinking: Optional[bool] = None,
         use_streaming: Optional[bool] = None
     ):
+        import config
+        
+        self.endpoint = getattr(config, 'ENDPOINT', 'openai').lower()
+        
+        if self.endpoint == 'bedrock':
+            self._init_bedrock(config, use_streaming)
+        else:
+            self._init_openai(api_key, model, base_url, enable_thinking, use_streaming, config)
+    
+    def _init_bedrock(self, config, use_streaming):
+        """Initialize AWS Bedrock client"""
+        import boto3
+        
+        self.model_id = getattr(config, 'BEDROCK_LLM_MODEL', 'amazon.nova-micro-v1:0')
+        self.region_name = getattr(config, 'AWS_REGION', 'us-east-1')
+        self.max_tokens = getattr(config, 'MAX_TOKENS', 4096)
+        self.use_streaming = use_streaming if use_streaming is not None else getattr(config, 'USE_STREAMING', True)
+        
+        # Detect model type
+        self.is_nova = self.model_id.startswith("amazon.nova")
+        self.is_claude = self.model_id.startswith("anthropic.claude")
+        
+        self.bedrock_runtime = boto3.client(
+            service_name='bedrock-runtime',
+            region_name=self.region_name
+        )
+        
+        self.client_type = "bedrock"
+        provider = "Nova" if self.is_nova else "Claude" if self.is_claude else "Unknown"
+        print(f"Initialized Bedrock LLM: {self.model_id} ({provider}) in {self.region_name}")
+    
+    def _init_openai(self, api_key, model, base_url, enable_thinking, use_streaming, config):
+        """Initialize OpenAI-compatible client"""
+        from openai import OpenAI
+        
         self.api_key = api_key or config.OPENAI_API_KEY
         self.model = model or config.LLM_MODEL
         self.base_url = base_url or config.OPENAI_BASE_URL
@@ -34,11 +74,15 @@ class LLMClient:
         if self.enable_thinking:
             print(f"Deep thinking mode enabled")
 
-        # self.client = OpenAI(**client_kwargs)
         self.client = OpenAI(
             base_url=self.base_url,
             api_key=self.api_key,
         )
+        
+        self.client_type = "openai"
+        print(f"Initialized OpenAI LLM: {self.model}")
+
+        print(f"Initialized OpenAI LLM: {self.model}")
 
     def chat_completion(
         self,
@@ -48,8 +92,166 @@ class LLMClient:
         max_retries: int = 3
     ) -> str:
         """
-        Standard chat completion with optional thinking mode and retry mechanism
+        Chat completion with automatic backend selection
         """
+        if self.client_type == "bedrock":
+            return self._chat_completion_bedrock(messages, temperature, response_format, max_retries)
+        else:
+            return self._chat_completion_openai(messages, temperature, response_format, max_retries)
+    
+    def _chat_completion_bedrock(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        response_format: Optional[Dict[str, str]],
+        max_retries: int
+    ) -> str:
+        """Chat completion using AWS Bedrock"""
+        # Detect if JSON output is requested (like OpenAI's response_format)
+        request_json = response_format and response_format.get("type") == "json_object"
+        
+        if self.is_nova:
+            body = self._build_nova_request(messages, temperature, request_json=request_json)
+        else:
+            body = self._build_claude_request(messages, temperature, request_json=request_json)
+        
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                if self.use_streaming:
+                    return self._stream_bedrock_response(body)
+                else:
+                    response = self.bedrock_runtime.invoke_model(
+                        modelId=self.model_id,
+                        body=json.dumps(body),
+                        contentType='application/json',
+                        accept='application/json'
+                    )
+                    response_body = json.loads(response['body'].read())
+                    return self._parse_bedrock_response(response_body)
+            except Exception as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    import time
+                    wait_time = 2 ** attempt
+                    print(f"Bedrock API call failed (attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(wait_time)
+        raise last_exception
+    
+    def _build_nova_request(self, messages: List[Dict[str, str]], temperature: float, request_json: bool = False) -> Dict:
+        """
+        Build request body for Amazon Nova models
+        
+        Matches legacy OpenAI behavior:
+        - When response_format={"type": "json_object"} is passed, append JSON instruction
+          to system prompt (Nova doesn't have native JSON mode like OpenAI)
+        """
+        system_prompt = ""
+        nova_messages = []
+        
+        for msg in messages:
+            if msg["role"] == "system":
+                system_prompt = msg["content"]
+            else:
+                nova_messages.append({
+                    "role": msg["role"],
+                    "content": [{"text": msg["content"]}]
+                })
+        
+        # Append JSON instruction to system prompt if JSON mode requested
+        # This mimics OpenAI's response_format={"type": "json_object"} behavior
+        if request_json:
+            json_instruction = "\n\nIMPORTANT: You must respond with valid JSON only. No markdown, no explanation, just pure JSON."
+            system_prompt = (system_prompt + json_instruction) if system_prompt else json_instruction.strip()
+        
+        body = {
+            "messages": nova_messages,
+            "inferenceConfig": {
+                "maxTokens": self.max_tokens,
+                "temperature": temperature,
+            }
+        }
+        
+        if system_prompt:
+            body["system"] = [{"text": system_prompt}]
+        
+        return body
+    
+    def _build_claude_request(self, messages: List[Dict[str, str]], temperature: float, request_json: bool = False) -> Dict:
+        """
+        Build request body for Anthropic Claude models
+        
+        Matches legacy OpenAI behavior for JSON mode.
+        """
+        system_prompt = ""
+        bedrock_messages = []
+        
+        for msg in messages:
+            if msg["role"] == "system":
+                system_prompt = msg["content"]
+            else:
+                bedrock_messages.append({
+                    "role": msg["role"],
+                    "content": [{"type": "text", "text": msg["content"]}]
+                })
+        
+        # Append JSON instruction if JSON mode requested
+        if request_json:
+            json_instruction = "\n\nIMPORTANT: You must respond with valid JSON only. No markdown, no explanation, just pure JSON."
+            system_prompt = (system_prompt + json_instruction) if system_prompt else json_instruction.strip()
+        
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": self.max_tokens,
+            "temperature": temperature,
+            "messages": bedrock_messages
+        }
+        
+        if system_prompt:
+            body["system"] = system_prompt
+        
+        return body
+    
+    def _parse_bedrock_response(self, response_body: Dict) -> str:
+        """Parse response based on model type"""
+        if self.is_nova:
+            return response_body['output']['message']['content'][0]['text']
+        else:
+            return response_body['content'][0]['text']
+    
+    def _stream_bedrock_response(self, body: Dict) -> str:
+        """Handle streaming response from Bedrock"""
+        response = self.bedrock_runtime.invoke_model_with_response_stream(
+            modelId=self.model_id,
+            body=json.dumps(body),
+            contentType='application/json',
+            accept='application/json'
+        )
+        
+        full_content = []
+        for event in response['body']:
+            chunk = json.loads(event['chunk']['bytes'])
+            
+            if self.is_nova:
+                if 'contentBlockDelta' in chunk:
+                    text = chunk['contentBlockDelta'].get('delta', {}).get('text', '')
+                    full_content.append(text)
+            else:
+                if chunk.get('type') == 'content_block_delta':
+                    text = chunk['delta'].get('text', '')
+                    full_content.append(text)
+        
+        print()
+        return ''.join(full_content)
+
+    def _chat_completion_openai(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        response_format: Optional[Dict[str, str]],
+        max_retries: int
+    ) -> str:
+        """Standard chat completion with OpenAI-compatible API"""
         kwargs = {
             "model": self.model,
             "messages": messages,

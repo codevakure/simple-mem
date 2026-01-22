@@ -148,3 +148,16 @@ zstandard==0.25.0
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
 tantivy
+
+# AWS Bedrock dependencies
+boto3==1.42.31
+botocore==1.42.31
+s3transfer==0.16.0
+jmespath==1.0.1
+
+# PostgreSQL + pgvector dependencies
+psycopg2-binary==2.9.11
+pgvector==0.4.2
+
+# Environment configuration
+python-dotenv==1.2.1

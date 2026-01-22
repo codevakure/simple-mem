@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: simplemem-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-simplemem}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-simplemem_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-simplemem_db}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-simplemem} -d ${POSTGRES_DB:-simplemem_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  default:
+    name: simplemem-network
+
+# ============================================================================
+# pgAdmin Desktop Connection Settings:
+# ============================================================================
+# Host: localhost
+# Port: 5432
+# Database: simplemem_db
+# Username: simplemem
+# Password: simplemem_dev_password
+# ============================================================================

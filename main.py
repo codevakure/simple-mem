@@ -229,12 +229,19 @@ def create_system(
 
 
 if __name__ == "__main__":
-    # Quick test with Qwen3 integration
-    print("🚀 Running SimpleMem Quick Test with Qwen3...")
+    # Quick test
+    print("🚀 Running SimpleMem Quick Test...")
 
     system = create_system(clear_db=True)
-    print(f"📌 Using embedding model: {system.memory_builder.vector_store.embedding_model.model_name}")
-    print(f"📌 Model type: {system.memory_builder.vector_store.embedding_model.model_type}")
+    
+    # Show embedding info (works for both local and Bedrock)
+    embed_model = system.memory_builder.vector_store.embedding_model
+    if hasattr(embed_model, 'model_name'):
+        print(f"📌 Using embedding model: {embed_model.model_name}")
+    elif hasattr(embed_model, 'model_id'):
+        print(f"📌 Using embedding model: {embed_model.model_id}")
+    print(f"📌 Model type: {embed_model.model_type}")
+    print(f"📌 Dimension: {embed_model.dimension}")
 
     # Add some test dialogues
     system.add_dialogue("Alice", "Bob, let's meet at Starbucks tomorrow at 2pm to discuss the new product", "2025-11-15T14:30:00")
