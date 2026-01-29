@@ -71,6 +71,24 @@ class MemoryEntry(BaseModel):
         description="Topic phrase summarized by LLM"
     )
     
+    # Memory classification for Ranger context
+    memory_type: Optional[str] = Field(
+        None,
+        description="Type: 'factual' (tool result), 'correction' (user corrected), 'pattern' (derived insight)"
+    )
+    scope: Optional[str] = Field(
+        None,
+        description="Scope: 'entity' (specific to one entity), 'universal' (applies broadly)"
+    )
+    source_entity: Optional[str] = Field(
+        None,
+        description="For patterns, the entity this insight was derived from (provenance)"
+    )
+    confidence: Optional[float] = Field(
+        None,
+        description="Confidence score: 1.0 for user corrections, 0.8 for tool results, 0.6 for patterns"
+    )
+    
     # Multi-tenant fields for agent/user isolation
     agent_id: Optional[str] = Field(
         None,

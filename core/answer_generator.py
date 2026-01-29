@@ -91,35 +91,64 @@ class AnswerGenerator:
 
     def _format_contexts(self, contexts: List[MemoryEntry]) -> str:
         """
-        Format contexts to readable text
+        Format contexts to readable text with special handling for pattern memories.
         """
+        # Separate pattern memories from factual memories
+        patterns = []
+        facts = []
+        
+        for entry in contexts:
+            if entry.memory_type == "pattern":
+                patterns.append(entry)
+            else:
+                facts.append(entry)
+        
         formatted = []
-        for i, entry in enumerate(contexts, 1):
-            parts = [f"[Context {i}]"]
-            parts.append(f"Content: {entry.lossless_restatement}")
+        
+        # Show patterns first if they exist (these guide behavior)
+        if patterns:
+            formatted.append("=" * 60)
+            formatted.append("LEARNED PATTERNS (Success/Error Guidance)")
+            formatted.append("=" * 60)
+            for i, entry in enumerate(patterns, 1):
+                parts = [f"[Pattern {i}] Confidence: {entry.confidence:.1f} | Scope: {entry.scope}"]
+                parts.append(f"  Guidance: {entry.lossless_restatement}")
+                if entry.keywords:
+                    parts.append(f"  Keywords: {', '.join(entry.keywords[:5])}")
+                formatted.append("\n".join(parts))
+            formatted.append("")
+        
+        # Then show factual content
+        if facts:
+            formatted.append("=" * 60)
+            formatted.append("FACTUAL CONTEXT")
+            formatted.append("=" * 60)
+            for i, entry in enumerate(facts, 1):
+                parts = [f"[Context {i}]"]
+                parts.append(f"Content: {entry.lossless_restatement}")
 
-            if entry.timestamp:
-                parts.append(f"Time: {entry.timestamp}")
+                if entry.timestamp:
+                    parts.append(f"Time: {entry.timestamp}")
 
-            if entry.location:
-                parts.append(f"Location: {entry.location}")
+                if entry.location:
+                    parts.append(f"Location: {entry.location}")
 
-            if entry.persons:
-                parts.append(f"Persons: {', '.join(entry.persons)}")
+                if entry.persons:
+                    parts.append(f"Persons: {', '.join(entry.persons)}")
 
-            if entry.entities:
-                parts.append(f"Related Entities: {', '.join(entry.entities)}")
+                if entry.entities:
+                    parts.append(f"Related Entities: {', '.join(entry.entities)}")
 
-            if entry.topic:
-                parts.append(f"Topic: {entry.topic}")
+                if entry.topic:
+                    parts.append(f"Topic: {entry.topic}")
 
-            formatted.append("\n".join(parts))
+                formatted.append("\n".join(parts))
 
         return "\n\n".join(formatted)
 
     def _build_answer_prompt(self, query: str, context_str: str) -> str:
         """
-        Build answer generation prompt
+        Build answer generation prompt with pattern handling
         """
         return f"""
 Answer the user's question based on the provided context.
@@ -129,30 +158,51 @@ User Question: {query}
 Relevant Context:
 {context_str}
 
+CRITICAL INSTRUCTIONS FOR PATTERN MEMORIES:
+
+If you see "LEARNED PATTERNS" section above:
+- These are ERROR PATTERNS (what failed) and SUCCESS PATTERNS (what worked)
+- ERROR PATTERNS tell you what approaches to AVOID (e.g., "LIMIT clause fails with syntax error")
+- SUCCESS PATTERNS tell you what approaches to USE (e.g., "Use information_schema.columns query - this works")
+- ALWAYS check patterns FIRST before attempting any action
+- If a pattern says an approach fails, DO NOT try that approach
+- If a pattern provides a working solution, USE that solution
+
+Example Pattern Usage:
+- Pattern says: "Query with LIMIT fails with syntax error - avoid LIMIT clause"
+- Your response: Skip any queries using LIMIT, use alternative approach
+- Pattern says: "Successfully retrieved schema using SELECT column_name FROM information_schema.columns"
+- Your response: Use that exact working query pattern
+
 Requirements:
-1. First, think through the reasoning process
-2. Then provide a very CONCISE answer (short phrase about core information)
-3. Answer must be based ONLY on the provided context
-4. All dates in the response must be formatted as 'DD Month YYYY' but you can output more or less details if needed
-5. Return your response in JSON format
+1. First, check if there are LEARNED PATTERNS that guide your approach
+2. Think through the reasoning process considering patterns
+3. Provide a CONCISE answer based on context
+4. Answer must be based ONLY on the provided context
+5. All dates in the response must be formatted as 'DD Month YYYY' but you can output more or less details if needed
+6. Return your response in JSON format
 
 Output Format:
 ```json
 {{
-  "reasoning": "Brief explanation of your thought process",
+  "reasoning": "Brief explanation of your thought process (mention if patterns influenced your approach)",
   "answer": "Concise answer in a short phrase"
 }}
 ```
 
-Example:
-Question: "When will they meet?"
-Context: "Alice suggested meeting Bob at 2025-11-16T14:00:00..."
+Example with Pattern:
+Question: "What's the schema of memory_entries table?"
+Context:
+[Pattern 1] Confidence: 0.7 | Scope: universal
+  Guidance: Query execution failed with 'syntax error at or near LIMIT' - avoid LIMIT clause in this database
+[Pattern 2] Confidence: 0.8 | Scope: universal
+  Guidance: Successfully retrieved schema using SELECT column_name, data_type FROM information_schema.columns WHERE table_name='memory_entries'
 
 Output:
 ```json
 {{
-  "reasoning": "The context explicitly states the meeting time as 2025-11-16T14:00:00",
-  "answer": "16 November 2025 at 2:00 PM"
+  "reasoning": "Pattern indicates LIMIT clause fails and provides working query using information_schema.columns",
+  "answer": "Use: SELECT column_name, data_type FROM information_schema.columns WHERE table_name='memory_entries'"
 }}
 ```
 

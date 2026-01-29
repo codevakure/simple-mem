@@ -10,9 +10,12 @@ from models.memory_entry import MemoryEntry, Dialogue
 from database.vector_store import get_vector_store
 from utils.embedding import EmbeddingModel
 from utils.llm_client import LLMClient
+from utils.logger import get_logger, estimate_tokens
 from core.memory_builder import MemoryBuilder
 from core.hybrid_retriever import HybridRetriever
 import config
+
+logger = get_logger(__name__)
 
 
 # =============================================================================
@@ -132,10 +135,13 @@ class AgentMemory:
         
         For non-blocking, use finalize_async() instead.
         """
+        logger.info(f"[AgentMemory] Finalizing for agent={self.agent_id}, user={self.user_id}")
         before = self.vector_store.count_rows()
-        self.memory_builder.process_remaining()
+        self.memory_builder.process_remaining(agent_id=self.agent_id, user_id=self.user_id)
         after = self.vector_store.count_rows()
-        return after - before
+        created = after - before
+        logger.info(f"[AgentMemory] Finalized: {created} memories created (total in DB: {after})")
+        return created
     
     def finalize_async(self) -> None:
         """
@@ -148,9 +154,11 @@ class AgentMemory:
         
         def _background_finalize():
             try:
-                self.memory_builder.process_remaining()
+                logger.info(f"[AgentMemory] Background finalize starting for agent={self.agent_id}")
+                self.memory_builder.process_remaining(agent_id=self.agent_id, user_id=self.user_id)
+                logger.info(f"[AgentMemory] Background finalize complete")
             except Exception as e:
-                print(f"[Background Finalize] Error: {e}")
+                logger.error(f"[Background Finalize] Error: {e}")
         
         thread = threading.Thread(target=_background_finalize, daemon=True)
         thread.start()
@@ -234,16 +242,57 @@ class _AgentMemoryBuilder(MemoryBuilder):
     
     def _generate_memory_entries(self, dialogues) -> List[MemoryEntry]:
         """Override to add agent_id/user_id and deduplicate similar entries."""
+        
+        # Log what's going INTO the LLM for extraction
+        logger.info(f"====================================================================")
+        logger.info(f"[LLM EXTRACTION] Input: {len(dialogues)} dialogues")
+        total_chars = 0
+        for i, dlg in enumerate(dialogues):
+            dlg_str = str(dlg)
+            total_chars += len(dlg_str)
+            logger.debug(f"  +-- Dialogue {i+1}/{len(dialogues)} ------------------------------")
+            logger.debug(f"  | Speaker: {dlg.speaker}")
+            logger.debug(f"  | Timestamp: {dlg.timestamp}")
+            for j in range(0, len(dlg.content), 300):
+                logger.debug(f"  | {dlg.content[j:j+300]}")
+            logger.debug(f"  +---------------------------------------------------------------")
+        
+        logger.info(f"  Total input: {total_chars} chars (~{estimate_tokens(str(dialogues))} tokens)")
+        
         entries = super()._generate_memory_entries(dialogues)
+        
+        # Log what the LLM EXTRACTED
+        logger.info(f"====================================================================")
+        logger.info(f"[LLM EXTRACTION RESULT] Output: {len(entries)} atomic memory entries")
+        for i, entry in enumerate(entries):
+            logger.info(f"  +-- Memory Entry {i+1}/{len(entries)} ---------------------------")
+            logger.info(f"  | Fact: {entry.lossless_restatement}")
+            logger.info(f"  | Keywords: {entry.keywords}")
+            logger.info(f"  | Persons: {entry.persons}")
+            logger.info(f"  | Entities: {entry.entities}")
+            logger.info(f"  | Topic: {entry.topic}")
+            logger.info(f"  +---------------------------------------------------------------")
         
         # Add agent_id and user_id to each entry
         for entry in entries:
             entry.agent_id = self.agent_id
             entry.user_id = self.user_id
         
+        logger.info(f"  Tagged with agent_id={self.agent_id}, user_id={self.user_id}")
+        
         # Deduplicate: check if similar content already exists
         if self.deduplicate and entries:
+            before_count = len(entries)
             entries = self._deduplicate_entries(entries)
+            if len(entries) < before_count:
+                logger.info(f"  Deduplication: {before_count} -> {len(entries)} entries")
+        
+        logger.info(f"====================================================================")
+        logger.info(f"[FINAL STORAGE] Storing {len(entries)} entries to vector database")
+        for i, entry in enumerate(entries):
+            logger.info(f"  [{i+1}] {entry.lossless_restatement[:80]}...")
+        
+        return entries
         
         return entries
     
@@ -287,7 +336,7 @@ class _AgentMemoryBuilder(MemoryBuilder):
                         )
                         
                         if similarity > self.similarity_threshold:
-                            print(f"[Dedup] Skipping duplicate (sim={similarity:.3f}): {entry.lossless_restatement[:60]}...")
+                            logger.debug(f"[Dedup] Skipping duplicate (sim={similarity:.3f}): {entry.lossless_restatement[:60]}...")
                             is_duplicate = True
                             break
                 
@@ -296,11 +345,11 @@ class _AgentMemoryBuilder(MemoryBuilder):
                     
             except Exception as e:
                 # If dedup check fails, keep the entry
-                print(f"[Dedup] Check failed: {e}")
+                logger.warning(f"[Dedup] Check failed: {e}")
                 unique_entries.append(entry)
         
         if len(unique_entries) < len(new_entries):
-            print(f"[Dedup] Kept {len(unique_entries)}/{len(new_entries)} entries (removed {len(new_entries) - len(unique_entries)} duplicates)")
+            logger.info(f"[Dedup] Kept {len(unique_entries)}/{len(new_entries)} entries (removed {len(new_entries) - len(unique_entries)} duplicates)")
         
         return unique_entries
     

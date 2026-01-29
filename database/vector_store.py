@@ -200,19 +200,38 @@ class LanceDBVectorStore:
         if not self._fts_initialized:
             self._init_fts_index()
 
-    def semantic_search(self, query: str, top_k: int = 5) -> List[MemoryEntry]:
+    def semantic_search(self, query: str, top_k: int = 5,
+                        agent_id: str = None, user_id: str = None) -> List[MemoryEntry]:
         """
         Semantic Layer Search - Dense vector similarity.
 
         Paper Reference: Section 3.1
         Retrieves based on v_k = E_dense(S_k) where S_k is the lossless restatement.
+        
+        Args:
+            query: Search query
+            top_k: Number of results
+            agent_id: Filter by agent (optional)
+            user_id: Filter by user (optional)
         """
         try:
             if self.table.count_rows() == 0:
                 return []
 
             query_vector = self.embedding_model.encode_single(query, is_query=True)
-            results = self.table.search(query_vector.tolist()).limit(top_k).to_list()
+            
+            # Build filter string for agent/user scoping
+            filters = []
+            if agent_id:
+                filters.append(f"agent_id = '{agent_id}'")
+            if user_id:
+                filters.append(f"user_id = '{user_id}'")
+            
+            search = self.table.search(query_vector.tolist())
+            if filters:
+                search = search.where(" AND ".join(filters), prefilter=True)
+            
+            results = search.limit(top_k).to_list()
             return self._results_to_entries(results)
 
         except Exception as e:
@@ -292,10 +311,46 @@ class LanceDBVectorStore:
             print(f"Error during structured search: {e}")
             return []
 
-    def get_all_entries(self) -> List[MemoryEntry]:
-        """Get all memory entries."""
-        results = self.table.to_arrow().to_pylist()
-        return self._results_to_entries(results)
+    def get_all_entries(self, agent_id: str = None, user_id: str = None) -> List[MemoryEntry]:
+        """Get all memory entries, optionally filtered by agent_id/user_id."""
+        try:
+            # Build filter for agent/user scoping
+            filters = []
+            if agent_id:
+                filters.append(f"agent_id = '{agent_id}'")
+            if user_id:
+                filters.append(f"user_id = '{user_id}'")
+            
+            if filters:
+                # Use LanceDB's filter syntax
+                filter_str = " AND ".join(filters)
+                results = self.table.search().where(filter_str).limit(100000).to_list()
+            else:
+                results = self.table.to_arrow().to_pylist()
+            
+            return self._results_to_entries(results)
+        except Exception as e:
+            print(f"Error getting all entries: {e}")
+            return []
+
+    def delete_entry(self, entry_id: str) -> bool:
+        """
+        Delete a single memory entry by entry_id.
+        
+        Args:
+            entry_id: The unique identifier of the entry to delete
+            
+        Returns:
+            True if deleted, False if not found
+        """
+        try:
+            # LanceDB uses SQL-like delete syntax
+            self.table.delete(f"entry_id = '{entry_id}'")
+            print(f"[LanceDB] Deleted entry: {entry_id}")
+            return True
+        except Exception as e:
+            print(f"[LanceDB] Failed to delete entry {entry_id}: {e}")
+            return False
 
     def optimize(self):
         """Optimize table after bulk insertions for better query performance."""
@@ -422,6 +477,10 @@ class PgVectorStore:
                     persons TEXT[] DEFAULT '{{}}',
                     entities TEXT[] DEFAULT '{{}}',
                     topic VARCHAR(512),
+                    memory_type VARCHAR(50),
+                    scope VARCHAR(50),
+                    source_entity VARCHAR(255),
+                    confidence REAL,
                     agent_id VARCHAR(255),
                     user_id VARCHAR(255),
                     vector vector({dimension}),
@@ -443,6 +502,22 @@ class PgVectorStore:
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                                    WHERE table_name = '{self.table_name}' AND column_name = 'user_id') THEN
                         ALTER TABLE {self.table_name} ADD COLUMN user_id VARCHAR(255);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                   WHERE table_name = '{self.table_name}' AND column_name = 'memory_type') THEN
+                        ALTER TABLE {self.table_name} ADD COLUMN memory_type VARCHAR(50);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                   WHERE table_name = '{self.table_name}' AND column_name = 'scope') THEN
+                        ALTER TABLE {self.table_name} ADD COLUMN scope VARCHAR(50);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                   WHERE table_name = '{self.table_name}' AND column_name = 'source_entity') THEN
+                        ALTER TABLE {self.table_name} ADD COLUMN source_entity VARCHAR(255);
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                   WHERE table_name = '{self.table_name}' AND column_name = 'confidence') THEN
+                        ALTER TABLE {self.table_name} ADD COLUMN confidence REAL;
                     END IF;
                 END $$;
             """)
@@ -505,7 +580,13 @@ class PgVectorStore:
         
         Args:
             results: Query results
-            include_ids: If True, expects agent_id, user_id at positions 8, 9
+            include_ids: If True, expects extended fields starting at position 8
+        
+        Column order when include_ids=True:
+            0: entry_id, 1: lossless_restatement, 2: keywords, 3: timestamp,
+            4: location, 5: persons, 6: entities, 7: topic,
+            8: memory_type, 9: scope, 10: source_entity, 11: confidence,
+            12: agent_id, 13: user_id
         """
         entries = []
         for r in results:
@@ -519,8 +600,12 @@ class PgVectorStore:
                     persons=list(r[5]) if r[5] else [],
                     entities=list(r[6]) if r[6] else [],
                     topic=r[7] or None,
-                    agent_id=r[8] if include_ids and len(r) > 8 else None,
-                    user_id=r[9] if include_ids and len(r) > 9 else None
+                    memory_type=r[8] if include_ids and len(r) > 8 else None,
+                    scope=r[9] if include_ids and len(r) > 9 else None,
+                    source_entity=r[10] if include_ids and len(r) > 10 else None,
+                    confidence=r[11] if include_ids and len(r) > 11 else None,
+                    agent_id=r[12] if include_ids and len(r) > 12 else None,
+                    user_id=r[13] if include_ids and len(r) > 13 else None
                 )
                 entries.append(entry)
             except Exception as e:
@@ -651,6 +736,10 @@ class PgVectorStore:
                 entry.persons,
                 entry.entities,
                 entry.topic or "",
+                entry.memory_type or "",
+                entry.scope or "",
+                entry.source_entity or "",
+                entry.confidence,
                 entry.agent_id,
                 entry.user_id,
                 vector.tolist()
@@ -667,7 +756,8 @@ class PgVectorStore:
                     f"""
                     INSERT INTO {self.table_name} 
                     (entry_id, lossless_restatement, keywords, timestamp, location, 
-                     persons, entities, topic, agent_id, user_id, vector)
+                     persons, entities, topic, memory_type, scope, source_entity, 
+                     confidence, agent_id, user_id, vector)
                     VALUES %s
                     ON CONFLICT (entry_id) DO UPDATE SET
                         lossless_restatement = EXCLUDED.lossless_restatement,
@@ -677,6 +767,10 @@ class PgVectorStore:
                         persons = EXCLUDED.persons,
                         entities = EXCLUDED.entities,
                         topic = EXCLUDED.topic,
+                        memory_type = EXCLUDED.memory_type,
+                        scope = EXCLUDED.scope,
+                        source_entity = EXCLUDED.source_entity,
+                        confidence = EXCLUDED.confidence,
                         agent_id = EXCLUDED.agent_id,
                         user_id = EXCLUDED.user_id,
                         vector = EXCLUDED.vector
@@ -742,7 +836,8 @@ class PgVectorStore:
             with conn.cursor() as cur:
                 cur.execute(f"""
                     SELECT entry_id, lossless_restatement, keywords, timestamp, 
-                           location, persons, entities, topic, agent_id, user_id
+                           location, persons, entities, topic, memory_type, scope,
+                           source_entity, confidence, agent_id, user_id
                     FROM {self.table_name}
                     {where_clause}
                     ORDER BY vector <=> %s::vector
@@ -801,7 +896,8 @@ class PgVectorStore:
             with conn.cursor() as cur:
                 cur.execute(f"""
                     SELECT entry_id, lossless_restatement, keywords, timestamp, 
-                           location, persons, entities, topic, agent_id, user_id,
+                           location, persons, entities, topic, memory_type, scope,
+                           source_entity, confidence, agent_id, user_id,
                            ts_rank(search_vector, plainto_tsquery('english', %s)) as rank
                     FROM {self.table_name}
                     WHERE {where_clause}
@@ -811,7 +907,7 @@ class PgVectorStore:
                 
                 results = cur.fetchall()
                 # Remove the rank column from results (last column)
-                return self._results_to_entries([r[:10] for r in results], include_ids=True)
+                return self._results_to_entries([r[:14] for r in results], include_ids=True)
 
         except Exception as e:
             print(f"Error during keyword search: {e}")
@@ -866,14 +962,15 @@ class PgVectorStore:
             with conn.cursor() as cur:
                 cur.execute(f"""
                     SELECT entry_id, lossless_restatement, keywords, timestamp, 
-                           location, persons, entities, topic
+                           location, persons, entities, topic, memory_type, scope,
+                           source_entity, confidence, agent_id, user_id
                     FROM {self.table_name}
                     WHERE {where_clause}
                     {limit_clause}
                 """, params)
                 
                 results = cur.fetchall()
-                return self._results_to_entries(results)
+                return self._results_to_entries(results, include_ids=True)
 
         except Exception as e:
             print(f"Error during structured search: {e}")
@@ -900,7 +997,8 @@ class PgVectorStore:
             with conn.cursor() as cur:
                 cur.execute(f"""
                     SELECT entry_id, lossless_restatement, keywords, timestamp, 
-                           location, persons, entities, topic, agent_id, user_id
+                           location, persons, entities, topic, memory_type, scope,
+                           source_entity, confidence, agent_id, user_id
                     FROM {self.table_name}
                     {where_clause}
                 """, params)
@@ -939,6 +1037,37 @@ class PgVectorStore:
                 cur.execute(f"TRUNCATE TABLE {self.table_name}")
                 conn.commit()
             print("Database cleared")
+        finally:
+            self._put_conn(conn)
+
+    def delete_entry(self, entry_id: str) -> bool:
+        """
+        Delete a single memory entry by entry_id.
+        
+        Args:
+            entry_id: The unique identifier of the entry to delete
+            
+        Returns:
+            True if deleted, False if not found
+        """
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM {self.table_name} WHERE entry_id = %s",
+                    (entry_id,)
+                )
+                conn.commit()
+                deleted = cur.rowcount > 0
+                if deleted:
+                    print(f"[PgVector] Deleted entry: {entry_id}")
+                else:
+                    print(f"[PgVector] Entry not found: {entry_id}")
+                return deleted
+        except Exception as e:
+            print(f"[PgVector] Failed to delete entry {entry_id}: {e}")
+            conn.rollback()
+            return False
         finally:
             self._put_conn(conn)
 

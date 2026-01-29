@@ -28,11 +28,33 @@ from contextlib import asynccontextmanager
 import uvicorn
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 
 import config
 from main import SimpleMemSystem
 from core.agent_mem import AgentMemory, get_all_agents, get_all_users, delete_agent_memories, delete_user_memories
+from utils.logger import get_logger, estimate_tokens
+
+# Initialize logger for server
+logger = get_logger(__name__)
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def sanitize_for_logging(text: str) -> str:
+    """
+    Sanitize text for Windows console logging by removing/replacing non-ASCII characters.
+    Prevents UnicodeEncodeError on Windows terminals.
+    """
+    try:
+        # Try to encode to ASCII, replace errors
+        return text.encode('ascii', errors='replace').decode('ascii')
+    except Exception:
+        # Fallback: filter to printable ASCII
+        return ''.join(c if ord(c) < 128 else '?' for c in text)
 
 
 # ============================================================================
@@ -96,13 +118,29 @@ class MemoryResponse(BaseModel):
     content: str
     keywords: List[str] = []
     timestamp: Optional[str] = None
+    # Classification fields for Ranger
+    memory_type: Optional[str] = None  # factual, correction, pattern
+    scope: Optional[str] = None  # entity, universal
+    source_entity: Optional[str] = None  # provenance for patterns
+    confidence: Optional[float] = None  # 1.0=correction, 0.8=factual, 0.6=pattern
     agent_id: Optional[str] = None
     user_id: Optional[str] = None
 
 
+class MemoryResultItem(BaseModel):
+    """Individual memory result with classification for Ranger."""
+    content: str
+    memory_type: Optional[str] = None  # factual, correction, pattern
+    scope: Optional[str] = None  # entity, universal
+    source_entity: Optional[str] = None  # provenance for patterns
+    confidence: Optional[float] = None  # 1.0=correction, 0.8=factual, 0.6=pattern
+    score: Optional[float] = None  # similarity score
+
+
 class QueryResponse(BaseModel):
     query: str
-    context: str
+    context: str  # Formatted string for LLM consumption
+    memories: Optional[List[MemoryResultItem]] = None  # Structured results for Ranger
     memory_count: int
     processing_time_ms: float
 
@@ -139,6 +177,13 @@ class SessionManager:
         self.sessions: Dict[str, dict] = {}
         self._lock = threading.Lock()
         
+        # Background processing executor (max 4 concurrent memory extractions)
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="memory_processor")
+        
+        # Track in-progress processing jobs
+        self._processing_jobs: Dict[str, dict] = {}  # session_key -> { 'started': datetime, 'future': Future }
+        self._processing_lock = threading.Lock()
+        
         # Start cleanup thread
         self._start_cleanup_thread()
     
@@ -161,37 +206,176 @@ class SessionManager:
             return self.sessions[key]
     
     def add_turn(self, agent_id: str, user_id: str, speaker: str, content: str, 
-                 timestamp: str = None, process_immediately: bool = False) -> dict:
+                 timestamp: str = None, process_immediately: bool = False,
+                 async_processing: bool = True) -> dict:
         """
         Add a single turn to session buffer.
+        
+        Args:
+            async_processing: If True (default), processing happens in background thread.
+                            If False, blocks until processing completes.
         
         Returns status including whether auto-processing was triggered.
         """
         session = self.get_or_create_session(agent_id, user_id)
         memory = session['memory']
         
+        # Log incoming turn with full content
+        session_key = self._session_key(agent_id, user_id)
+        content_tokens = estimate_tokens(content)
+        
+        # Sanitize content for logging
+        safe_content = sanitize_for_logging(content)
+        
+        logger.info(f"===============================================================")
+        logger.info(f"[INCOMING TURN] Session: {session_key}")
+        logger.info(f"  Speaker: {speaker}")
+        logger.info(f"  Content tokens: ~{content_tokens}")
+        logger.info(f"  Timestamp: {timestamp or 'auto'}")
+        logger.debug(f"  +- FULL CONTENT -----------------------------------------------")
+        # Log full content in chunks for readability
+        for i in range(0, len(safe_content), 500):
+            chunk = safe_content[i:i+500]
+            logger.debug(f"  | {chunk}")
+        logger.debug(f"  +---------------------------------------------------------------")
+        
+        # Check if already processing this session
+        with self._processing_lock:
+            is_processing = session_key in self._processing_jobs
+        
+        if is_processing:
+            logger.info(f"  [SKIP] Session {session_key} already processing in background")
+            # Still add to buffer for next batch
+            memory.add_dialogue(speaker, content, timestamp)
+            session['turn_count'] += 1
+            return {
+                'session_key': session_key,
+                'turn_count': session['turn_count'],
+                'buffer_size': len(memory.memory_builder.dialogue_buffer),
+                'processed': False,
+                'processing_in_progress': True,
+                'message': 'Session is currently processing previous batch'
+            }
+        
         # Add dialogue to buffer (no auto-process)
         memory.add_dialogue(speaker, content, timestamp)
         session['turn_count'] += 1
         
         result = {
-            'session_key': self._session_key(agent_id, user_id),
+            'session_key': session_key,
             'turn_count': session['turn_count'],
             'buffer_size': len(memory.memory_builder.dialogue_buffer),
             'processed': False
         }
         
+        logger.info(f"  Buffer status: {result['buffer_size']} turns (auto-process at {self.auto_process_turns})")
+        
         # Check if we should process
         should_process = process_immediately or (session['turn_count'] >= self.auto_process_turns)
         
         if should_process:
-            count = memory.finalize()
+            logger.info(f"====================================================================")
+            logger.info(f"[PROCESSING BUFFER] Session: {session_key}")
+            logger.info(f"  Turns in buffer: {result['buffer_size']}")
+            logger.info(f"  Mode: {'ASYNC (background)' if async_processing else 'SYNC (blocking)'}")
+            
+            # Log all buffered dialogues before processing
+            logger.info(f"  +-- BUFFERED DIALOGUES FOR LLM ------------------------------")
+            for i, dlg in enumerate(memory.memory_builder.dialogue_buffer):
+                dlg_tokens = estimate_tokens(str(dlg))
+                logger.info(f"  | [{i+1}] {dlg.speaker}: {str(dlg)[:100]}... (~{dlg_tokens} tokens)")
+            logger.info(f"  +-------------------------------------------------------------")
+            
+            # Snapshot the buffer for processing (so new turns go to fresh buffer)
+            dialogues_to_process = list(memory.memory_builder.dialogue_buffer)
+            memory.memory_builder.dialogue_buffer.clear()
             session['turn_count'] = 0  # Reset counter
-            result['processed'] = True
-            result['memories_created'] = count
-            result['buffer_size'] = 0
+            
+            if async_processing:
+                # Process in background thread
+                result['processed'] = False
+                result['processing_started'] = True
+                result['buffer_size'] = 0
+                result['message'] = 'Processing started in background'
+                
+                # Submit to executor
+                future = self._executor.submit(
+                    self._process_dialogues_async,
+                    session_key, memory, dialogues_to_process
+                )
+                
+                # Track the job
+                with self._processing_lock:
+                    self._processing_jobs[session_key] = {
+                        'started': datetime.now(),
+                        'future': future,
+                        'dialogue_count': len(dialogues_to_process)
+                    }
+                
+                logger.info(f"[ASYNC] Processing submitted to background executor")
+            else:
+                # Synchronous processing (blocking)
+                count = self._process_dialogues_sync(memory, dialogues_to_process)
+                result['processed'] = True
+                result['memories_created'] = count
+                result['buffer_size'] = 0
+                
+                logger.info(f"[SYNC] Processing complete: {count} memory entries")
+            
+            logger.info(f"====================================================================")
         
         return result
+    
+    def _process_dialogues_sync(self, memory: AgentMemory, dialogues: list) -> int:
+        """Process dialogues synchronously, return count of memories created."""
+        # Temporarily add dialogues back to buffer for processing
+        memory.memory_builder.dialogue_buffer.extend(dialogues)
+        count = memory.finalize()
+        return count
+    
+    def _process_dialogues_async(self, session_key: str, memory: AgentMemory, dialogues: list):
+        """Process dialogues in background thread."""
+        try:
+            logger.info(f"[ASYNC WORKER] Starting processing for {session_key}")
+            logger.info(f"  Dialogues: {len(dialogues)}")
+            start_time = time.time()
+            
+            # Add dialogues to buffer and process
+            memory.memory_builder.dialogue_buffer.extend(dialogues)
+            count = memory.finalize()
+            
+            duration = time.time() - start_time
+            logger.info(f"[ASYNC WORKER] Complete for {session_key}")
+            logger.info(f"  Memories created: {count}")
+            logger.info(f"  Duration: {duration:.2f}s")
+            
+        except Exception as e:
+            logger.error(f"[ASYNC WORKER] Error processing {session_key}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            
+        finally:
+            # Remove from processing jobs
+            with self._processing_lock:
+                if session_key in self._processing_jobs:
+                    del self._processing_jobs[session_key]
+    
+    def get_processing_status(self, agent_id: str, user_id: str) -> dict:
+        """Check if a session has background processing in progress."""
+        session_key = self._session_key(agent_id, user_id)
+        
+        with self._processing_lock:
+            if session_key not in self._processing_jobs:
+                return {'session_key': session_key, 'processing': False}
+            
+            job = self._processing_jobs[session_key]
+            return {
+                'session_key': session_key,
+                'processing': True,
+                'started': job['started'].isoformat(),
+                'dialogue_count': job['dialogue_count'],
+                'done': job['future'].done()
+            }
     
     def process_session(self, agent_id: str, user_id: str) -> dict:
         """Force process all buffered turns for a session."""
@@ -374,6 +558,27 @@ async def store_conversation(input: ConversationInput):
     """
     start = time.time()
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # RAW REQUEST LOGGING - See full conversation structure
+    # ═══════════════════════════════════════════════════════════════════════════
+    logger.info("=" * 70)
+    logger.info("[RAW REQUEST] POST /conversation")
+    logger.info(f"  agent_id: {input.agent_id}")
+    logger.info(f"  user_id: {input.user_id}")
+    logger.info(f"  async_processing: {input.async_processing}")
+    logger.info(f"  dialogue_count: {len(input.dialogues)}")
+    
+    # Log each dialogue turn with structure analysis
+    logger.info(f"  +-- DIALOGUES ------------------------------------------------")
+    for i, d in enumerate(input.dialogues):
+        has_tool = "[Tool" in d.content
+        has_result = "[Tool Result" in d.content or "[Result" in d.content
+        content_preview = sanitize_for_logging(d.content[:150])
+        logger.info(f"  | [{i+1}] {d.speaker}: {content_preview}...")
+        logger.info(f"  |      tokens: ~{estimate_tokens(d.content)}, has_tool: {has_tool}, has_result: {has_result}")
+    logger.info(f"  +------------------------------------------------------------")
+    logger.info("=" * 70)
+    
     memory = AgentMemory(agent_id=input.agent_id, user_id=input.user_id)
     
     for d in input.dialogues:
@@ -516,8 +721,26 @@ async def query_memories(input: QueryInput):
     - agent_id only: Searches that agent's memories
     - user_id only: Searches that user's memories
     - Both: Searches specific agent AND user memories
+    
+    **Response includes:**
+    - `context`: Formatted string for LLM consumption
+    - `memories`: Structured list with classification (memory_type, scope, confidence)
+    
+    **Memory Classification (for Ranger):**
+    - `memory_type`: 'factual' (tool result), 'correction' (user corrected), 'pattern' (derived)
+    - `scope`: 'entity' (specific to one entity), 'universal' (applies broadly)
+    - `confidence`: 1.0 (user correction), 0.8 (tool result), 0.6 (pattern)
     """
     start = time.time()
+    
+    # Log incoming query
+    logger.info("=" * 70)
+    logger.info("[QUERY] POST /query - Memory retrieval request")
+    logger.info(f"  agent_id: {input.agent_id}")
+    logger.info(f"  user_id: {input.user_id}")
+    logger.info(f"  query: {input.query[:200]}{'...' if len(input.query) > 200 else ''}")
+    logger.info(f"  max_results: {input.max_results}")
+    logger.info(f"  deep_analysis: {input.deep_analysis}")
     
     memory = AgentMemory(
         agent_id=input.agent_id, 
@@ -527,11 +750,32 @@ async def query_memories(input: QueryInput):
     context = memory.get_context_string(input.query, input.max_results)
     memories = memory.get_context(input.query, input.max_results)
     
+    # Build structured results for Ranger
+    memory_items = [
+        MemoryResultItem(
+            content=m.lossless_restatement,
+            memory_type=m.memory_type,
+            scope=m.scope,
+            source_entity=m.source_entity,
+            confidence=m.confidence
+        )
+        for m in memories
+    ]
+    
     elapsed = (time.time() - start) * 1000
+    
+    # Log response
+    logger.info(f"[QUERY] Response: {len(memory_items)} memories found in {elapsed:.0f}ms")
+    for i, m in enumerate(memory_items[:5], 1):
+        logger.info(f"  [{i}] [{m.memory_type}, conf={m.confidence}] {m.content[:80]}...")
+    if len(memory_items) > 5:
+        logger.info(f"  ... and {len(memory_items) - 5} more")
+    logger.info("=" * 70)
     
     return QueryResponse(
         query=input.query,
         context=context,
+        memories=memory_items,
         memory_count=len(memories),
         processing_time_ms=round(elapsed, 2)
     )
@@ -582,6 +826,10 @@ async def get_memories(
             content=m.lossless_restatement,
             keywords=m.keywords or [],
             timestamp=m.timestamp,
+            memory_type=getattr(m, 'memory_type', None),
+            scope=getattr(m, 'scope', None),
+            source_entity=getattr(m, 'source_entity', None),
+            confidence=getattr(m, 'confidence', None),
             agent_id=getattr(m, 'agent_id', None),
             user_id=getattr(m, 'user_id', None)
         )
@@ -694,6 +942,44 @@ async def add_session_turn(input: TurnInput):
     ```
     """
     start = time.time()
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # RAW REQUEST LOGGING - See exactly what Ranger sends
+    # ═══════════════════════════════════════════════════════════════════════════
+    logger.info("=" * 70)
+    logger.info("[RAW REQUEST] POST /session/turn")
+    logger.info(f"  agent_id: {input.agent_id}")
+    logger.info(f"  user_id: {input.user_id}")
+    logger.info(f"  speaker: {input.speaker}")
+    logger.info(f"  timestamp: {input.timestamp}")
+    logger.info(f"  process_now: {input.process_now}")
+    logger.info(f"  content_length: {len(input.content)} chars")
+    logger.info(f"  content_tokens: ~{estimate_tokens(input.content)}")
+    
+    # Log content structure analysis
+    has_tool_call = "[Tool Call:" in input.content or "[Tool:" in input.content
+    has_tool_result = "[Tool Result:" in input.content
+    has_reasoning = "[Reasoning]" in input.content or "[Thinking]" in input.content
+    has_agent_response = "[Agent Response]" in input.content
+    
+    logger.info(f"  +-- CONTENT STRUCTURE --------------------------------------")
+    logger.info(f"  | Has Tool Calls:    {has_tool_call}")
+    logger.info(f"  | Has Tool Results:  {has_tool_result}")
+    logger.info(f"  | Has Reasoning:     {has_reasoning}")
+    logger.info(f"  | Has Agent Response:{has_agent_response}")
+    logger.info(f"  +------------------------------------------------------------")
+    
+    # Log full content with clear boundaries
+    safe_content = sanitize_for_logging(input.content)
+    logger.debug(f"  +-- FULL RAW CONTENT --------------------------------------")
+    for i, line in enumerate(safe_content.split('\n')):
+        if i < 100:  # Limit to 100 lines for readability
+            logger.debug(f"  | {line[:200]}")
+        elif i == 100:
+            logger.debug(f"  | ... (truncated, {len(safe_content.split(chr(10)))} total lines)")
+            break
+    logger.debug(f"  +------------------------------------------------------------")
+    logger.info("=" * 70)
     
     result = session_manager.add_turn(
         agent_id=input.agent_id,

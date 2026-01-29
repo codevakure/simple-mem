@@ -8,14 +8,43 @@ Supports multiple backends:
 The backend is selected based on config.ENDPOINT
 """
 import json
+import time
 from typing import List, Dict, Any, Optional
 import os
+from dataclasses import dataclass
+from utils.logger import get_logger, estimate_tokens, format_token_usage
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class TokenUsage:
+    """Token usage statistics for an LLM call"""
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    estimated: bool = True  # True if estimated, False if from API response
+    
+    def __str__(self):
+        est = " (est)" if self.estimated else ""
+        return f"in={self.input_tokens} out={self.output_tokens} total={self.total_tokens}{est}"
 
 
 class LLMClient:
     """
     Unified LLM client interface supporting OpenAI and Bedrock
     """
+    # Model context limits for token tracking
+    MODEL_CONTEXT_LIMITS = {
+        'amazon.nova-micro-v1:0': 128000,
+        'amazon.nova-lite-v1:0': 300000,
+        'amazon.nova-pro-v1:0': 300000,
+        'anthropic.claude-3-5-sonnet-20241022-v2:0': 200000,
+        'gpt-4.1-mini': 128000,
+        'gpt-4.1': 128000,
+        'gpt-4o': 128000,
+    }
+    
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -42,6 +71,13 @@ class LLMClient:
         self.max_tokens = getattr(config, 'MAX_TOKENS', 4096)
         self.use_streaming = use_streaming if use_streaming is not None else getattr(config, 'USE_STREAMING', True)
         
+        # Token tracking
+        self.last_usage: Optional[TokenUsage] = None
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.call_count = 0
+        self.context_limit = self.MODEL_CONTEXT_LIMITS.get(self.model_id, 128000)
+        
         # Detect model type
         self.is_nova = self.model_id.startswith("amazon.nova")
         self.is_claude = self.model_id.startswith("anthropic.claude")
@@ -53,7 +89,7 @@ class LLMClient:
         
         self.client_type = "bedrock"
         provider = "Nova" if self.is_nova else "Claude" if self.is_claude else "Unknown"
-        print(f"Initialized Bedrock LLM: {self.model_id} ({provider}) in {self.region_name}")
+        logger.info(f"Initialized Bedrock LLM: {self.model_id} ({provider}) in {self.region_name}, context={self.context_limit//1000}K")
     
     def _init_openai(self, api_key, model, base_url, enable_thinking, use_streaming, config):
         """Initialize OpenAI-compatible client"""
@@ -65,14 +101,21 @@ class LLMClient:
         self.enable_thinking = enable_thinking if enable_thinking is not None else config.ENABLE_THINKING
         self.use_streaming = use_streaming if use_streaming is not None else config.USE_STREAMING
 
+        # Token tracking
+        self.last_usage: Optional[TokenUsage] = None
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.call_count = 0
+        self.context_limit = self.MODEL_CONTEXT_LIMITS.get(self.model, 128000)
+
         # Initialize OpenAI client with optional base_url
         client_kwargs = {"api_key": self.api_key}
         if self.base_url:
             client_kwargs["base_url"] = self.base_url
-            print(f"Using custom OpenAI base URL: {self.base_url}")
+            logger.debug(f"Using custom OpenAI base URL: {self.base_url}")
 
         if self.enable_thinking:
-            print(f"Deep thinking mode enabled")
+            logger.info("Deep thinking mode enabled")
 
         self.client = OpenAI(
             base_url=self.base_url,
@@ -80,9 +123,7 @@ class LLMClient:
         )
         
         self.client_type = "openai"
-        print(f"Initialized OpenAI LLM: {self.model}")
-
-        print(f"Initialized OpenAI LLM: {self.model}")
+        logger.info(f"Initialized OpenAI LLM: {self.model}, context={self.context_limit//1000}K")
 
     def chat_completion(
         self,
@@ -92,12 +133,47 @@ class LLMClient:
         max_retries: int = 3
     ) -> str:
         """
-        Chat completion with automatic backend selection
+        Chat completion with automatic backend selection and token tracking
         """
+        start_time = time.time()
+        
+        # Estimate input tokens from messages
+        input_text = " ".join(m.get("content", "") for m in messages)
+        input_tokens_est = estimate_tokens(input_text)
+        
+        logger.debug(f"LLM call starting", input_tokens=input_tokens_est)
+        
         if self.client_type == "bedrock":
-            return self._chat_completion_bedrock(messages, temperature, response_format, max_retries)
+            result = self._chat_completion_bedrock(messages, temperature, response_format, max_retries)
         else:
-            return self._chat_completion_openai(messages, temperature, response_format, max_retries)
+            result = self._chat_completion_openai(messages, temperature, response_format, max_retries)
+        
+        # Track output tokens
+        output_tokens_est = estimate_tokens(result)
+        self.last_usage = TokenUsage(
+            input_tokens=input_tokens_est,
+            output_tokens=output_tokens_est,
+            total_tokens=input_tokens_est + output_tokens_est,
+            estimated=True
+        )
+        
+        # Update cumulative stats
+        self.total_input_tokens += input_tokens_est
+        self.total_output_tokens += output_tokens_est
+        self.call_count += 1
+        
+        duration_ms = int((time.time() - start_time) * 1000)
+        pct_context = (self.last_usage.total_tokens / self.context_limit) * 100
+        
+        logger.info(
+            f"LLM call #{self.call_count} complete: {format_token_usage(input_tokens_est, output_tokens_est, self.context_limit)}",
+            duration_ms=duration_ms
+        )
+        
+        if pct_context > 50:
+            logger.warning(f"High context usage: {pct_context:.1f}% of {self.context_limit//1000}K limit")
+        
+        return result
     
     def _chat_completion_bedrock(
         self,
@@ -132,9 +208,8 @@ class LLMClient:
             except Exception as e:
                 last_exception = e
                 if attempt < max_retries - 1:
-                    import time
                     wait_time = 2 ** attempt
-                    print(f"Bedrock API call failed (attempt {attempt + 1}/{max_retries}): {e}")
+                    logger.warning(f"Bedrock API call failed (attempt {attempt + 1}/{max_retries}): {e}, retrying in {wait_time}s")
                     time.sleep(wait_time)
         raise last_exception
     
@@ -241,7 +316,6 @@ class LLMClient:
                     text = chunk['delta'].get('text', '')
                     full_content.append(text)
         
-        print()
         return ''.join(full_content)
 
     def _chat_completion_openai(
@@ -288,21 +362,15 @@ class LLMClient:
                 else:
                     response = self.client.chat.completions.create(**kwargs)
                     return response.choices[0].message.content
-                
-                # kwargs["stream"] = True
-                # return self._handle_streaming_response(**kwargs)
                     
             except Exception as e:
-                # print(e)
                 last_exception = e
                 if attempt < max_retries - 1:
-                    import time
                     wait_time = (2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
-                    print(f"LLM API call failed (attempt {attempt + 1}/{max_retries}): {e}")
-                    print(f"Retrying in {wait_time} seconds...")
+                    logger.warning(f"LLM API call failed (attempt {attempt + 1}/{max_retries}): {e}, retrying in {wait_time}s")
                     time.sleep(wait_time)
                 else:
-                    print(f"LLM API call failed after {max_retries} attempts: {e}")
+                    logger.error(f"LLM API call failed after {max_retries} attempts: {e}")
         
         # If all retries failed, raise the last exception
         raise last_exception
@@ -314,24 +382,30 @@ class LLMClient:
         full_content = []
         stream = self.client.chat.completions.create(**kwargs)
 
-        # for chunk in stream:
-        #     if chunk.choices is not None:
-        #         print(chunk.choices[0].delta.content)
-        
-        # print('---------')
-
         for chunk in stream:
-            # print(chunk)
-            # fix list index out of range
             if len(chunk.choices) > 0 and chunk.choices[0].delta.content is not None:
                 content = chunk.choices[0].delta.content
                 full_content.append(content)
-                # print(full_content)
-                # Optional: print streaming content in real-time
-                # print(content, end='', flush=True)
-        # print(full_content)
-        print()
+        
         return ''.join(full_content)
+    
+    def get_token_stats(self) -> Dict[str, Any]:
+        """
+        Get cumulative token usage statistics.
+        
+        Returns:
+            Dict with total_input_tokens, total_output_tokens, call_count, avg_per_call
+        """
+        return {
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_tokens": self.total_input_tokens + self.total_output_tokens,
+            "call_count": self.call_count,
+            "avg_input_per_call": self.total_input_tokens // max(1, self.call_count),
+            "avg_output_per_call": self.total_output_tokens // max(1, self.call_count),
+            "context_limit": self.context_limit,
+            "last_usage": str(self.last_usage) if self.last_usage else None
+        }
 
     def extract_json(self, text: str) -> Any:
         """
