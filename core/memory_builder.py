@@ -22,6 +22,27 @@ from functools import partial
 logger = get_logger(__name__)
 
 
+def filter_for_storage(entries: List[MemoryEntry]) -> List[MemoryEntry]:
+    """
+    Filter entries before storing to database.
+    
+    Only stores Insights (pattern) and Feedback (correction).
+    Tool call results (factual) are skipped - they're volatile and not useful for agent context.
+    
+    This keeps the database focused on stable, valuable memories.
+    Easy to re-enable factual storage by modifying this filter.
+    """
+    stored_types = {'pattern', 'correction'}  # Insights + Feedback only
+    
+    filtered = [e for e in entries if e.memory_type in stored_types]
+    skipped = len(entries) - len(filtered)
+    
+    if skipped > 0:
+        logger.debug(f"Filtered out {skipped} factual entries (volatile tool call data)")
+    
+    return filtered
+
+
 class MemoryBuilder:
     """
     Memory Builder - Stage 1: Semantic Structured Compression
@@ -163,31 +184,36 @@ class MemoryBuilder:
             for i, entry in enumerate(entries, 1):
                 logger.debug(f"  [{i}] {entry.lossless_restatement[:80]}{'...' if len(entry.lossless_restatement) > 80 else ''}")
             
-            # Use conflict resolution if enabled
-            if self.conflict_resolver and self.enable_conflict_resolution:
-                logger.debug("Running conflict resolution...")
-                resolutions = self.conflict_resolver.resolve_conflicts(
-                    entries, agent_id=agent_id, user_id=user_id
-                )
-                counts = self.conflict_resolver.apply_resolutions(resolutions)
-            else:
-                # Direct add without conflict resolution
-                self.vector_store.add_entries(entries)
+            # Filter out factual entries (volatile tool call data)
+            entries_to_store = filter_for_storage(entries)
             
-            self.previous_entries = entries  # Save as context
+            # Use conflict resolution if enabled
+            if entries_to_store:
+                if self.conflict_resolver and self.enable_conflict_resolution:
+                    logger.debug("Running conflict resolution...")
+                    resolutions = self.conflict_resolver.resolve_conflicts(
+                        entries_to_store, agent_id=agent_id, user_id=user_id
+                    )
+                    counts = self.conflict_resolver.apply_resolutions(resolutions)
+                else:
+                    # Direct add without conflict resolution
+                    self.vector_store.add_entries(entries_to_store)
+            
+            self.previous_entries = entries  # Save as context (include all for LLM reference)
             self.processed_count += len(window)
 
         duration_ms = int((time.time() - start_time) * 1000)
         logger.info(f"Window complete: {len(entries)} entries generated", 
                    entries=len(entries), duration_ms=duration_ms)
 
-    def process_remaining(self, agent_id: str = None, user_id: str = None):
+    def process_remaining(self, agent_id: str = None, user_id: str = None, user_name: str = None):
         """
         Process remaining dialogues (fallback method, normally handled in parallel)
         
         Args:
             agent_id: Optional agent ID for scoped conflict resolution
             user_id: Optional user ID for scoped conflict resolution
+            user_name: Optional human-readable user name
         """
         if self.dialogue_buffer:
             start_time = time.time()
@@ -198,24 +224,29 @@ class MemoryBuilder:
             
             entries = self._generate_memory_entries(self.dialogue_buffer)
             if entries:
-                # Set agent_id and user_id on all entries
+                # Set agent_id, user_id, and user_name on all entries
                 for entry in entries:
                     entry.agent_id = agent_id
                     entry.user_id = user_id
+                    entry.user_name = user_name
                 
                 logger.info(f"Extracted {len(entries)} memory entries from remaining dialogues")
                 for i, entry in enumerate(entries, 1):
                     logger.debug(f"  [{i}] {entry.lossless_restatement[:80]}{'...' if len(entry.lossless_restatement) > 80 else ''}")
                 
+                # Filter out factual entries (volatile tool call data)
+                entries_to_store = filter_for_storage(entries)
+                
                 # Use conflict resolution if enabled
-                if self.conflict_resolver and self.enable_conflict_resolution:
-                    logger.debug("Running conflict resolution...")
-                    resolutions = self.conflict_resolver.resolve_conflicts(
-                        entries, agent_id=agent_id, user_id=user_id
-                    )
-                    self.conflict_resolver.apply_resolutions(resolutions)
-                else:
-                    self.vector_store.add_entries(entries)
+                if entries_to_store:
+                    if self.conflict_resolver and self.enable_conflict_resolution:
+                        logger.debug("Running conflict resolution...")
+                        resolutions = self.conflict_resolver.resolve_conflicts(
+                            entries_to_store, agent_id=agent_id, user_id=user_id
+                        )
+                        self.conflict_resolver.apply_resolutions(resolutions)
+                    else:
+                        self.vector_store.add_entries(entries_to_store)
                 
                 self.processed_count += len(self.dialogue_buffer)
             
@@ -287,8 +318,16 @@ class MemoryBuilder:
                     response_format=response_format
                 )
 
+                # Log raw LLM response for debugging
+                logger.debug(f"[RAW LLM RESPONSE] First 1000 chars: {response[:1000]}")
+
                 # Parse response
                 entries = self._parse_llm_response(response, dialogue_ids)
+                
+                # Log if entries are missing classification
+                for entry in entries:
+                    if not entry.memory_type:
+                        logger.warning(f"[MISSING TYPE] Entry has no memory_type: {entry.lossless_restatement[:80]}")
                 
                 duration_ms = int((time.time() - start_time) * 1000)
                 logger.debug(f"Memory extraction complete: {len(entries)} entries", 
@@ -311,193 +350,102 @@ class MemoryBuilder:
         context: str
     ) -> str:
         """
-        Build LLM extraction prompt
+        Build LLM extraction prompt - Optimized for Nova Micro
+        Uses XML tags, simple structure, and clear examples
         """
-        return f"""
-Your task is to extract all valuable KNOWLEDGE and FACTS from the following dialogues and convert them into structured memory entries.
+        return f"""<task>
+Extract memories from the conversation below. Return a JSON array.
+</task>
+
+<rules>
+1. Each memory MUST have these 3 required fields:
+   - memory_type: "correction" OR "pattern" OR "factual"
+   - scope: "universal" OR "entity"
+   - confidence: 1.0 OR 0.8 OR 0.6
+
+2. Use these values:
+   - User corrected agent → memory_type="correction", confidence=1.0
+   - Error or success pattern → memory_type="pattern", confidence=0.8
+   - Data from tools → memory_type="factual", confidence=0.6
+
+3. Include source context: WHY was this learned?
+</rules>
+
+<output_format>
+Return ONLY a JSON array. No markdown. No explanation.
+Start with [ and end with ]
+
+Each object must have:
+- lossless_restatement (string): The fact with source context
+- keywords (array): Key terms
+- memory_type (string): "correction" or "pattern" or "factual"
+- scope (string): "universal" or "entity"
+- confidence (number): 1.0 or 0.8 or 0.6
+- topic (string): Short topic
+- entities (array): Related entities
+</output_format>
+
+<example_input>
+user: What is the payment schedule?
+agent: The payment schedule is Same Day Payment.
+user: No that's wrong. It's Annual Payment.
+</example_input>
+
+<example_output>
+[
+  {{
+    "lossless_restatement": "The payment schedule is Annual Payment, not Same Day Payment. (Source: User corrected agent saying 'No that's wrong. It's Annual Payment.')",
+    "keywords": ["payment schedule", "Annual Payment"],
+    "memory_type": "correction",
+    "scope": "universal",
+    "confidence": 1.0,
+    "topic": "Payment schedule correction",
+    "entities": []
+  }}
+]
+</example_output>
+
+<example_input>
+user: Query the database
+agent: Running: SELECT * FROM users LIMIT 10
+agent: Error: syntax error at or near LIMIT
+agent: Running: SELECT * FROM users
+agent: Success: Found 5 users
+</example_input>
+
+<example_output>
+[
+  {{
+    "lossless_restatement": "LIMIT clause causes 'syntax error at or near LIMIT' in this database. Do not use LIMIT.",
+    "keywords": ["LIMIT", "syntax error", "avoid"],
+    "memory_type": "pattern",
+    "scope": "universal",
+    "confidence": 0.8,
+    "topic": "SQL error pattern",
+    "entities": []
+  }},
+  {{
+    "lossless_restatement": "SELECT without LIMIT works in this database. Use simple SELECT for queries.",
+    "keywords": ["SELECT", "working query"],
+    "memory_type": "pattern",
+    "scope": "universal",
+    "confidence": 0.8,
+    "topic": "SQL success pattern",
+    "entities": []
+  }}
+]
+</example_output>
 
 {context}
 
-[Current Window Dialogues]
+<conversation>
 {dialogue_text}
+</conversation>
 
-[CRITICAL: What to Extract]
-Focus on extracting FACTS and KNOWLEDGE, not just conversation flow:
-
-1. **Tool/Action Results** (memory_type: "factual", confidence: 0.8)
-   - Extract the ACTUAL DATA returned from tools
-   - BAD: "The user queried the database for tables"
-   - GOOD: "The database contains one table called 'memory_entries' in the public schema"
-
-2. **User Corrections** (memory_type: "correction", confidence: 1.0)
-   - When user corrects the agent, extract the CORRECTED information
-   - This is high-confidence because user explicitly confirmed it
-   - BAD: "The user corrected the agent about payment schedule"
-   - GOOD: "Loan #12345 has Annual Payment schedule, not Same Day Payment"
-
-3. **ERROR PATTERNS - CRITICAL FOR LEARNING** (memory_type: "pattern", scope: "universal", confidence: 0.7)
-   - When agent tries something and it FAILS, extract what went wrong
-   - Include the specific error message and what caused it
-   - BAD: "The agent ran a SQL query"
-   - GOOD: "SQL query with LIMIT clause fails with 'syntax error at or near LIMIT' in this database - use standard SELECT without LIMIT instead"
-   - This prevents repeating the same failed approach
-
-4. **SUCCESS PATTERNS - CRITICAL FOR LEARNING** (memory_type: "pattern", scope: "universal", confidence: 0.8)
-   - When agent finally succeeds after failures, extract what WORKED
-   - BAD: "The agent got the schema"
-   - GOOD: "To get table schema in this database, use: SELECT column_name, data_type FROM information_schema.columns WHERE table_name='<table>' - this works reliably"
-   - This helps reuse successful approaches
-
-5. **Derived Patterns** (memory_type: "pattern", confidence: 0.6)
-   - General insights derived from corrections with provenance
-   - Helps avoid same mistake in future
-   - MUST include source_entity to show where insight came from
-
-6. **Technical Details** (memory_type: "factual")
-   - Extract specific technical facts discovered
-
-7. **Learned Preferences/Rules** (memory_type: "correction" if user stated, "pattern" if inferred)
-   - User preferences, constraints, or rules mentioned
-
-[CRITICAL: Memory Classification]
-
-**memory_type** - How was this knowledge obtained?
-- "factual": Direct data from tool results, documents, APIs
-- "correction": User explicitly corrected agent (highest trust)
-- "pattern": Derived insight/rule with provenance (use cautiously)
-
-**scope** - How broadly should this apply?
-- "entity": Applies ONLY to a specific entity (loan #12345, customer ABC)
-- "universal": Applies broadly (all 30-year loans, all users, system-wide rule)
-
-**source_entity** - For patterns, which entity was this derived from?
-- Example: "Loan #12345" - so Ranger knows the provenance
-
-**confidence** - How reliable is this memory?
-- 1.0: User correction (explicit confirmation)
-- 0.8: Tool/document result (direct data)
-- 0.6: Derived pattern (inferred, use with caution)
-
-[Output Format]
-Return a JSON array:
-
-```json
-[
-  {{
-    "lossless_restatement": "Complete factual statement",
-    "keywords": ["keyword1", "keyword2", ...],
-    "timestamp": "YYYY-MM-DDTHH:MM:SS or null",
-    "location": "location name or null",
-    "persons": ["name1", ...],
-    "entities": ["entity1", ...],
-    "topic": "topic phrase",
-    "memory_type": "factual|correction|pattern",
-    "scope": "entity|universal",
-    "source_entity": "entity ID for patterns, null for direct facts",
-    "confidence": 0.6|0.8|1.0
-  }}
-]
-```
-
-[Example - Tool Result (factual, entity-specific)]
-```json
-{{
-  "lossless_restatement": "Loan #12345 (John Smith) has loan amount of $250,000, 30-year term, and 6.5% interest rate.",
-  "keywords": ["Loan #12345", "John Smith", "$250,000", "30-year", "6.5%"],
-  "entities": ["Loan #12345"],
-  "topic": "Loan financial details",
-  "memory_type": "factual",
-  "scope": "entity",
-  "source_entity": null,
-  "confidence": 0.8
-}}
-```
-
-[Example - User Correction (correction, entity-specific)]
-```json
-{{
-  "lossless_restatement": "Loan #12345 (John Smith) has Annual Payment schedule, not Same Day Payment.",
-  "keywords": ["Loan #12345", "Annual Payment", "payment schedule"],
-  "entities": ["Loan #12345"],
-  "topic": "Loan payment schedule correction",
-  "memory_type": "correction",
-  "scope": "entity",
-  "source_entity": null,
-  "confidence": 1.0
-}}
-```
-
-[Example - Derived Pattern (pattern, universal)]
-```json
-{{
-  "lossless_restatement": "When extracting loan payment schedules, verify the value carefully - 'Annual Payment' may be misread as 'Same Day Payment' (discovered from Loan #12345 correction).",
-  "keywords": ["loan extraction", "payment schedule", "verification"],
-  "entities": [],
-  "topic": "Loan extraction quality check",
-  "memory_type": "pattern",
-  "scope": "universal",
-  "source_entity": "Loan #12345",
-  "confidence": 0.6
-}}
-```
-
-[Example - Universal Rule from User (correction, universal)]
-```json
-{{
-  "lossless_restatement": "For 30-year term loans, the payment schedule must be either Annual Payment or Monthly Payment. Same Day Payment is NOT valid.",
-  "keywords": ["30-year loans", "payment schedule", "Annual Payment", "Monthly Payment"],
-  "entities": [],
-  "topic": "Loan payment schedule rule",
-  "memory_type": "correction",
-  "scope": "universal",
-  "source_entity": null,
-  "confidence": 1.0
-}}
-```
-
-[Example - Technical Fact (factual, universal)]
-```json
-{{
-  "lossless_restatement": "The search_vector column in memory_entries table is used for embedding-based semantic search, NOT PostgreSQL full-text search, despite using tsvector data type.",
-  "keywords": ["search_vector", "embedding search", "semantic search"],
-  "entities": ["search_vector", "memory_entries"],
-  "topic": "search_vector column purpose",
-  "memory_type": "correction",
-  "scope": "universal",
-  "source_entity": null,
-  "confidence": 1.0
-}}
-```
-
-[Example - Error Pattern - PREVENTS REPEATING FAILURES]
-```json
-{{
-  "lossless_restatement": "Query execution failed with 'syntax error at or near LIMIT' when using: SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') LIMIT 10. This database does not support standard LIMIT clause.",
-  "keywords": ["LIMIT", "syntax error", "query failed", "information_schema.tables", "avoid LIMIT"],
-  "entities": ["information_schema.tables"],
-  "topic": "SQL query error pattern",
-  "memory_type": "pattern",
-  "scope": "universal",
-  "source_entity": null,
-  "confidence": 0.7
-}}
-```
-
-[Example - Success Pattern - REUSES WORKING APPROACHES]
-```json
-{{
-  "lossless_restatement": "Successfully retrieved table schema using: SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'memory_entries' ORDER BY ordinal_position. Use this approach for schema queries in this database.",
-  "keywords": ["information_schema.columns", "schema query", "successful pattern", "column_name", "data_type"],
-  "entities": ["information_schema.columns", "memory_entries"],
-  "topic": "SQL successful query pattern",
-  "memory_type": "pattern",
-  "scope": "universal",
-  "source_entity": null,
-  "confidence": 0.8
-}}
-```
-
-Now process the dialogues above. Return ONLY the JSON array with classified knowledge.
+<instruction>
+Extract memories from the conversation above. Return ONLY a JSON array.
+Remember: EVERY object needs memory_type, scope, and confidence.
+</instruction>
 """
 
     def _parse_llm_response(
@@ -517,6 +465,19 @@ Now process the dialogues above. Return ONLY the JSON array with classified know
         entries = []
         for item in data:
             # Create MemoryEntry with classification fields
+            # Default to 'pattern' if memory_type not provided (safer than filtering out)
+            memory_type = item.get("memory_type")
+            if not memory_type:
+                # Infer type from content
+                content = item.get("lossless_restatement", "").lower()
+                if "correction" in content or "corrected" in content or "source: user" in content:
+                    memory_type = "correction"
+                elif "failed" in content or "error" in content or "success" in content:
+                    memory_type = "pattern"
+                else:
+                    memory_type = "pattern"  # Default to pattern so it gets stored
+                logger.info(f"[AUTO-TYPE] Assigned memory_type='{memory_type}' to entry: {item.get('lossless_restatement', '')[:60]}...")
+            
             entry = MemoryEntry(
                 lossless_restatement=item["lossless_restatement"],
                 keywords=item.get("keywords", []),
@@ -525,11 +486,11 @@ Now process the dialogues above. Return ONLY the JSON array with classified know
                 persons=item.get("persons", []),
                 entities=item.get("entities", []),
                 topic=item.get("topic"),
-                # New classification fields
-                memory_type=item.get("memory_type"),
-                scope=item.get("scope"),
+                # Classification fields with defaults
+                memory_type=memory_type,
+                scope=item.get("scope", "universal"),
                 source_entity=item.get("source_entity"),
-                confidence=item.get("confidence")
+                confidence=item.get("confidence", 0.8)
             )
             entries.append(entry)
 
@@ -564,17 +525,22 @@ Now process the dialogues above. Return ONLY the JSON array with classified know
         if all_entries:
             print(f"\n[Parallel Processing] Processing {len(all_entries)} entries...")
             
+            # Filter out factual entries (volatile tool call data)
+            entries_to_store = filter_for_storage(all_entries)
+            print(f"[Parallel Processing] Storing {len(entries_to_store)} entries (filtered {len(all_entries) - len(entries_to_store)} factual)")
+            
             # Use conflict resolution if enabled
-            if self.conflict_resolver and self.enable_conflict_resolution:
-                print(f"[ConflictResolver] Checking for conflicts in batch...")
-                resolutions = self.conflict_resolver.resolve_conflicts(all_entries)
-                self.conflict_resolver.apply_resolutions(resolutions)
-            else:
-                self.vector_store.add_entries(all_entries)
+            if entries_to_store:
+                if self.conflict_resolver and self.enable_conflict_resolution:
+                    print(f"[ConflictResolver] Checking for conflicts in batch...")
+                    resolutions = self.conflict_resolver.resolve_conflicts(entries_to_store)
+                    self.conflict_resolver.apply_resolutions(resolutions)
+                else:
+                    self.vector_store.add_entries(entries_to_store)
             
             self.processed_count += sum(len(window) for window in windows)
             
-            # Update previous entries (use last window's entries for context)
+            # Update previous entries (use last window's entries for context - include all)
             if all_entries:
                 self.previous_entries = all_entries[-10:]  # Keep last 10 entries for context
         

@@ -332,6 +332,127 @@ class LanceDBVectorStore:
         except Exception as e:
             print(f"Error getting all entries: {e}")
             return []
+    
+    def get_entries_paginated(
+        self,
+        agent_id: str = None,
+        user_id: str = None,
+        page: int = 1,
+        limit: int = 20,
+        search: str = None,
+        scope: str = None,
+        memory_type: str = None,
+        min_confidence: float = None
+    ) -> dict:
+        """
+        Get paginated and filtered memory entries with true server-side processing.
+        
+        Args:
+            agent_id: Filter by agent ID
+            user_id: Filter by user ID
+            page: Page number (1-indexed)
+            limit: Results per page
+            search: SEMANTIC search using vector similarity (not just text)
+            scope: Filter by scope (entity/universal)
+            memory_type: Filter by type (factual/correction/pattern)
+            min_confidence: Minimum confidence threshold
+            
+        Returns:
+            Dictionary with memories, total, page, limit, totalPages, hasNextPage, hasPrevPage
+        """
+        try:
+            # Build SQL-like filter for metadata
+            filters = []
+            if agent_id:
+                filters.append(f"agent_id = '{agent_id}'")
+            if user_id:
+                filters.append(f"user_id = '{user_id}'")
+            if scope and scope in ['entity', 'universal']:
+                filters.append(f"scope = '{scope}'")
+            if memory_type and memory_type in ['factual', 'correction', 'pattern']:
+                filters.append(f"memory_type = '{memory_type}'")
+            if min_confidence is not None:
+                filters.append(f"confidence >= {min_confidence}")
+            
+            # SEMANTIC SEARCH: Use vector similarity if search query provided
+            if search:
+                # Generate embedding for search query
+                search_embedding = self.embedding_model.embed([search])[0]
+                
+                # Use LanceDB's vector search with filters
+                query_builder = self.table.search(search_embedding)
+                
+                if filters:
+                    filter_str = " AND ".join(filters)
+                    query_builder = query_builder.where(filter_str)
+                
+                # Semantic search - get enough for pagination display
+                # Vector search is already ranked by relevance, so limit is fine
+                max_semantic_results = min(page * limit + limit, 200)  # Cap at 200 for performance
+                results = query_builder.limit(max_semantic_results).to_list()
+                all_entries = self._results_to_entries(results)
+                
+                # For semantic search, total is the number of matching results
+                total = len(all_entries)
+            else:
+                # No search - just filter by metadata
+                # Get count first, then only fetch the page we need
+                if filters:
+                    filter_str = " AND ".join(filters)
+                    # Get count
+                    count_results = self.table.search().where(filter_str).limit(10000).to_list()
+                    total = len(count_results)
+                    
+                    # Now get just the page we need (offset + limit)
+                    # LanceDB doesn't have OFFSET, so we fetch up to offset+limit and slice
+                    fetch_limit = (page - 1) * limit + limit
+                    results = self.table.search().where(filter_str).limit(fetch_limit).to_list()
+                else:
+                    try:
+                        total = self.table.count_rows()
+                    except:
+                        total = len(self.table.to_arrow().to_pylist())
+                    
+                    fetch_limit = (page - 1) * limit + limit
+                    results = self.table.to_arrow().to_pylist()[:fetch_limit]
+                
+                all_entries = self._results_to_entries(results)
+            
+            # Sort by timestamp (newest first) - only for non-search queries
+            # Semantic search is already sorted by relevance
+            if not search:
+                all_entries.sort(
+                    key=lambda x: x.timestamp if x.timestamp else '',
+                    reverse=True
+                )
+            
+            # Calculate pagination (total already set above for each branch)
+            total_pages = (total + limit - 1) // limit if limit > 0 else 0
+            offset = (page - 1) * limit
+            
+            # Slice for current page
+            paginated_entries = all_entries[offset:offset + limit]
+            
+            return {
+                'memories': paginated_entries,
+                'total': total,
+                'page': page,
+                'limit': limit,
+                'totalPages': total_pages,
+                'hasNextPage': page < total_pages,
+                'hasPrevPage': page > 1
+            }
+        except Exception as e:
+            print(f"Error getting paginated entries: {e}")
+            return {
+                'memories': [],
+                'total': 0,
+                'page': page,
+                'limit': limit,
+                'totalPages': 0,
+                'hasNextPage': False,
+                'hasPrevPage': False
+            }
 
     def delete_entry(self, entry_id: str) -> bool:
         """
@@ -483,6 +604,7 @@ class PgVectorStore:
                     confidence REAL,
                     agent_id VARCHAR(255),
                     user_id VARCHAR(255),
+                    user_name VARCHAR(255),
                     vector vector({dimension}),
                     search_vector tsvector GENERATED ALWAYS AS (
                         to_tsvector('english', lossless_restatement)
@@ -518,6 +640,10 @@ class PgVectorStore:
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                                    WHERE table_name = '{self.table_name}' AND column_name = 'confidence') THEN
                         ALTER TABLE {self.table_name} ADD COLUMN confidence REAL;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                                   WHERE table_name = '{self.table_name}' AND column_name = 'user_name') THEN
+                        ALTER TABLE {self.table_name} ADD COLUMN user_name VARCHAR(255);
                     END IF;
                 END $$;
             """)
@@ -586,11 +712,20 @@ class PgVectorStore:
             0: entry_id, 1: lossless_restatement, 2: keywords, 3: timestamp,
             4: location, 5: persons, 6: entities, 7: topic,
             8: memory_type, 9: scope, 10: source_entity, 11: confidence,
-            12: agent_id, 13: user_id
+            12: agent_id, 13: user_id, 14: user_name, 15: created_at
         """
         entries = []
         for r in results:
             try:
+                # Convert created_at datetime to ISO string if present
+                created_at_str = None
+                if include_ids and len(r) > 15 and r[15]:
+                    created_at_val = r[15]
+                    if hasattr(created_at_val, 'isoformat'):
+                        created_at_str = created_at_val.isoformat()
+                    else:
+                        created_at_str = str(created_at_val)
+                
                 entry = MemoryEntry(
                     entry_id=r[0],
                     lossless_restatement=r[1],
@@ -605,7 +740,9 @@ class PgVectorStore:
                     source_entity=r[10] if include_ids and len(r) > 10 else None,
                     confidence=r[11] if include_ids and len(r) > 11 else None,
                     agent_id=r[12] if include_ids and len(r) > 12 else None,
-                    user_id=r[13] if include_ids and len(r) > 13 else None
+                    user_id=r[13] if include_ids and len(r) > 13 else None,
+                    user_name=r[14] if include_ids and len(r) > 14 else None,
+                    created_at=created_at_str
                 )
                 entries.append(entry)
             except Exception as e:
@@ -742,6 +879,7 @@ class PgVectorStore:
                 entry.confidence,
                 entry.agent_id,
                 entry.user_id,
+                entry.user_name,
                 vector.tolist()
             )
             for entry, vector in zip(entries_to_add, vectors_to_add)
@@ -757,7 +895,7 @@ class PgVectorStore:
                     INSERT INTO {self.table_name} 
                     (entry_id, lossless_restatement, keywords, timestamp, location, 
                      persons, entities, topic, memory_type, scope, source_entity, 
-                     confidence, agent_id, user_id, vector)
+                     confidence, agent_id, user_id, user_name, vector)
                     VALUES %s
                     ON CONFLICT (entry_id) DO UPDATE SET
                         lossless_restatement = EXCLUDED.lossless_restatement,
@@ -773,6 +911,7 @@ class PgVectorStore:
                         confidence = EXCLUDED.confidence,
                         agent_id = EXCLUDED.agent_id,
                         user_id = EXCLUDED.user_id,
+                        user_name = EXCLUDED.user_name,
                         vector = EXCLUDED.vector
                     """,
                     data,
@@ -837,7 +976,7 @@ class PgVectorStore:
                 cur.execute(f"""
                     SELECT entry_id, lossless_restatement, keywords, timestamp, 
                            location, persons, entities, topic, memory_type, scope,
-                           source_entity, confidence, agent_id, user_id
+                           source_entity, confidence, agent_id, user_id, user_name
                     FROM {self.table_name}
                     {where_clause}
                     ORDER BY vector <=> %s::vector
@@ -897,7 +1036,7 @@ class PgVectorStore:
                 cur.execute(f"""
                     SELECT entry_id, lossless_restatement, keywords, timestamp, 
                            location, persons, entities, topic, memory_type, scope,
-                           source_entity, confidence, agent_id, user_id,
+                           source_entity, confidence, agent_id, user_id, user_name,
                            ts_rank(search_vector, plainto_tsquery('english', %s)) as rank
                     FROM {self.table_name}
                     WHERE {where_clause}
@@ -907,7 +1046,7 @@ class PgVectorStore:
                 
                 results = cur.fetchall()
                 # Remove the rank column from results (last column)
-                return self._results_to_entries([r[:14] for r in results], include_ids=True)
+                return self._results_to_entries([r[:15] for r in results], include_ids=True)
 
         except Exception as e:
             print(f"Error during keyword search: {e}")
@@ -963,7 +1102,7 @@ class PgVectorStore:
                 cur.execute(f"""
                     SELECT entry_id, lossless_restatement, keywords, timestamp, 
                            location, persons, entities, topic, memory_type, scope,
-                           source_entity, confidence, agent_id, user_id
+                           source_entity, confidence, agent_id, user_id, user_name
                     FROM {self.table_name}
                     WHERE {where_clause}
                     {limit_clause}
@@ -998,12 +1137,164 @@ class PgVectorStore:
                 cur.execute(f"""
                     SELECT entry_id, lossless_restatement, keywords, timestamp, 
                            location, persons, entities, topic, memory_type, scope,
-                           source_entity, confidence, agent_id, user_id
+                           source_entity, confidence, agent_id, user_id, user_name
                     FROM {self.table_name}
                     {where_clause}
                 """, params)
                 results = cur.fetchall()
                 return self._results_to_entries(results, include_ids=True)
+        finally:
+            self._put_conn(conn)
+
+    def get_entries_paginated(
+        self,
+        agent_id: str = None,
+        user_id: str = None,
+        page: int = 1,
+        limit: int = 20,
+        search: str = None,
+        scope: str = None,
+        memory_type: str = None,
+        min_confidence: float = None
+    ) -> dict:
+        """
+        Get paginated and filtered memory entries with true server-side processing.
+        
+        Args:
+            agent_id: Filter by agent ID
+            user_id: Filter by user ID
+            page: Page number (1-indexed)
+            limit: Results per page
+            search: SEMANTIC search using vector similarity (not just text)
+            scope: Filter by scope (entity/universal)
+            memory_type: Filter by type (factual/correction/pattern)
+            min_confidence: Minimum confidence threshold
+            
+        Returns:
+            Dictionary with memories, total, page, limit, totalPages, hasNextPage, hasPrevPage
+        """
+        conn = self._get_conn()
+        try:
+            # Build WHERE conditions
+            conditions = []
+            params = []
+            
+            if agent_id:
+                conditions.append("agent_id = %s")
+                params.append(agent_id)
+            if user_id:
+                conditions.append("user_id = %s")
+                params.append(user_id)
+            if scope and scope in ['entity', 'universal']:
+                conditions.append("scope = %s")
+                params.append(scope)
+            if memory_type and memory_type in ['factual', 'correction', 'pattern']:
+                conditions.append("memory_type = %s")
+                params.append(memory_type)
+            if min_confidence is not None:
+                conditions.append("confidence >= %s")
+                params.append(min_confidence)
+            
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            
+            # SEMANTIC SEARCH: Use vector similarity if search provided
+            if search:
+                # Generate embedding for search query
+                search_embedding = self.embedding_model.embed([search])[0]
+                
+                with conn.cursor() as cur:
+                    # Get total count with vector similarity
+                    count_conditions = conditions.copy()
+                    count_params = params.copy()
+                    
+                    # Use pgvector's <=> operator for cosine distance
+                    # Lower distance = more similar
+                    count_query = f"""
+                        SELECT COUNT(*) 
+                        FROM {self.table_name}
+                        {where_clause}
+                    """
+                    cur.execute(count_query, count_params)
+                    total = cur.fetchone()[0]
+                    
+                    # Calculate pagination
+                    total_pages = (total + limit - 1) // limit if limit > 0 else 0
+                    offset = (page - 1) * limit
+                    
+                    # Get paginated results with vector similarity ordering
+                    query_params = params.copy()
+                    query_params.append(search_embedding)
+                    query_params.extend([limit, offset])
+                    
+                    # Order by vector similarity (cosine distance)
+                    results_query = f"""
+                        SELECT entry_id, lossless_restatement, keywords, timestamp, 
+                               location, persons, entities, topic, memory_type, scope,
+                               source_entity, confidence, agent_id, user_id, user_name, created_at,
+                               (embedding <=> %s::vector) as distance
+                        FROM {self.table_name}
+                        {where_clause}
+                        ORDER BY distance ASC
+                        LIMIT %s OFFSET %s
+                    """
+                    cur.execute(results_query, query_params)
+                    results = cur.fetchall()
+                    # Remove distance column (last column)
+                    entries = self._results_to_entries([r[:16] for r in results], include_ids=True)
+            else:
+                # No semantic search - just metadata filters
+                with conn.cursor() as cur:
+                    # Get total count
+                    count_params = params.copy()
+                    cur.execute(f"""
+                        SELECT COUNT(*) FROM {self.table_name}
+                        {where_clause}
+                    """, count_params)
+                    total = cur.fetchone()[0]
+                    
+                    # Calculate pagination
+                    total_pages = (total + limit - 1) // limit if limit > 0 else 0
+                    offset = (page - 1) * limit
+                    
+                    # Get paginated results
+                    query_params = params.copy()
+                    query_params.extend([limit, offset])
+                    
+                    cur.execute(f"""
+                        SELECT entry_id, lossless_restatement, keywords, timestamp, 
+                               location, persons, entities, topic, memory_type, scope,
+                               source_entity, confidence, agent_id, user_id, user_name, created_at
+                        FROM {self.table_name}
+                        {where_clause}
+                        ORDER BY created_at DESC NULLS LAST
+                        LIMIT %s OFFSET %s
+                    """, query_params)
+                    
+                    results = cur.fetchall()
+                    entries = self._results_to_entries(results, include_ids=True)
+            
+            return {
+                'memories': entries,
+                'total': total,
+                'page': page,
+                'limit': limit,
+                'totalPages': total_pages,
+                'hasNextPage': page < total_pages,
+                'hasPrevPage': page > 1
+            }
+        except Exception as e:
+            print(f"Error getting paginated entries: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'memories': [],
+                'total': 0,
+                'page': page,
+                'limit': limit,
+                'totalPages': 0,
+                'hasNextPage': False,
+                'hasPrevPage': False
+            }
         finally:
             self._put_conn(conn)
 

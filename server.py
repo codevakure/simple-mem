@@ -72,12 +72,14 @@ class ConversationInput(BaseModel):
     dialogues: List[DialogueTurn] = Field(..., description="Conversation turns")
     agent_id: Optional[str] = Field(None, description="Agent identifier (optional)")
     user_id: Optional[str] = Field(None, description="User identifier (optional)")
+    user_name: Optional[str] = Field(None, description="Human-readable user name (optional)")
     async_processing: bool = Field(True, description="Process in background (non-blocking) - default True")
     
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "agent_id": "sql_agent",
             "user_id": "user123",
+            "user_name": "John Doe",
             "dialogues": [
                 {"speaker": "user", "content": "Show me Q4 revenue"},
                 {"speaker": "agent", "content": "Based on revenue_table, it's $1M"},
@@ -93,6 +95,7 @@ class QueryInput(BaseModel):
     query: str = Field(..., description="Query to search memories")
     agent_id: Optional[str] = Field(None, description="Filter by agent (optional)")
     user_id: Optional[str] = Field(None, description="Filter by user (optional)")
+    user_name: Optional[str] = Field(None, description="Human-readable user name (optional, for display)")
     max_results: int = Field(10, description="Maximum results")
     deep_analysis: bool = Field(False, description="Enable LLM planning/reflection (slower but better for complex queries)")
     
@@ -100,6 +103,7 @@ class QueryInput(BaseModel):
         "example": {
             "query": "What is Q3 revenue for Texas Capital?",
             "agent_id": "sql_agent",
+            "user_name": "John Doe",
             "deep_analysis": False
         }
     })
@@ -111,6 +115,7 @@ class KnowledgeInput(BaseModel):
     category: str = Field("general", description="Category: schema, rule, preference")
     agent_id: Optional[str] = Field(None, description="Agent identifier (optional)")
     user_id: Optional[str] = Field(None, description="User identifier (optional)")
+    user_name: Optional[str] = Field(None, description="Human-readable user name (optional)")
 
 
 class MemoryResponse(BaseModel):
@@ -125,6 +130,8 @@ class MemoryResponse(BaseModel):
     confidence: Optional[float] = None  # 1.0=correction, 0.8=factual, 0.6=pattern
     agent_id: Optional[str] = None
     user_id: Optional[str] = None
+    user_name: Optional[str] = None  # Human-readable user name
+    created_at: Optional[str] = None  # Database creation timestamp
 
 
 class MemoryResultItem(BaseModel):
@@ -190,24 +197,30 @@ class SessionManager:
     def _session_key(self, agent_id: str, user_id: str) -> str:
         return f"{agent_id or 'global'}::{user_id or 'global'}"
     
-    def get_or_create_session(self, agent_id: str, user_id: str) -> 'AgentMemory':
+    def get_or_create_session(self, agent_id: str, user_id: str, user_name: str = None) -> 'AgentMemory':
         """Get existing session or create new one."""
         key = self._session_key(agent_id, user_id)
         
         with self._lock:
             if key not in self.sessions:
                 self.sessions[key] = {
-                    'memory': AgentMemory(agent_id=agent_id, user_id=user_id),
+                    'memory': AgentMemory(agent_id=agent_id, user_id=user_id, user_name=user_name),
                     'last_active': datetime.now(),
-                    'turn_count': 0
+                    'turn_count': 0,
+                    'user_name': user_name
                 }
+            elif user_name and not self.sessions[key].get('user_name'):
+                # Update user_name if it wasn't set before
+                self.sessions[key]['user_name'] = user_name
+                self.sessions[key]['memory'].user_name = user_name
+                self.sessions[key]['memory'].memory_builder.user_name = user_name
             
             self.sessions[key]['last_active'] = datetime.now()
             return self.sessions[key]
     
     def add_turn(self, agent_id: str, user_id: str, speaker: str, content: str, 
                  timestamp: str = None, process_immediately: bool = False,
-                 async_processing: bool = True) -> dict:
+                 async_processing: bool = True, user_name: str = None) -> dict:
         """
         Add a single turn to session buffer.
         
@@ -217,7 +230,7 @@ class SessionManager:
         
         Returns status including whether auto-processing was triggered.
         """
-        session = self.get_or_create_session(agent_id, user_id)
+        session = self.get_or_create_session(agent_id, user_id, user_name)
         memory = session['memory']
         
         # Log incoming turn with full content
@@ -418,6 +431,7 @@ class SessionManager:
                 'session_key': key,
                 'agent_id': agent_id,
                 'user_id': user_id,
+                'user_name': session.get('user_name'),
                 'turn_count': session['turn_count'],
                 'buffer_size': len(memory.memory_builder.dialogue_buffer),
                 'last_active': session['last_active'].isoformat(),
@@ -565,6 +579,7 @@ async def store_conversation(input: ConversationInput):
     logger.info("[RAW REQUEST] POST /conversation")
     logger.info(f"  agent_id: {input.agent_id}")
     logger.info(f"  user_id: {input.user_id}")
+    logger.info(f"  user_name: {input.user_name}")
     logger.info(f"  async_processing: {input.async_processing}")
     logger.info(f"  dialogue_count: {len(input.dialogues)}")
     
@@ -579,7 +594,7 @@ async def store_conversation(input: ConversationInput):
     logger.info(f"  +------------------------------------------------------------")
     logger.info("=" * 70)
     
-    memory = AgentMemory(agent_id=input.agent_id, user_id=input.user_id)
+    memory = AgentMemory(agent_id=input.agent_id, user_id=input.user_id, user_name=input.user_name)
     
     for d in input.dialogues:
         memory.add_dialogue(d.speaker, d.content, d.timestamp)
@@ -803,24 +818,42 @@ async def add_knowledge(input: KnowledgeInput):
 
 
 # ----------------------------------------------------------------------------
-# GET /memories - List memories with filters
+# GET /memories - List memories with filters and pagination
 # ----------------------------------------------------------------------------
-@app.get("/memories", response_model=List[MemoryResponse], tags=["Memory"])
+@app.get("/memories", tags=["Memory"])
 async def get_memories(
     agent_id: str = Query(None, description="Filter by agent"),
-    user_id: str = Query(None, description="Filter by user")
+    user_id: str = Query(None, description="Filter by user"),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    limit: int = Query(20, ge=1, le=100, description="Results per page"),
+    search: str = Query(None, description="SEMANTIC search using vector similarity (not text search)"),
+    scope: str = Query(None, description="Filter by scope: entity or universal"),
+    memory_type: str = Query(None, description="Filter by type: factual, correction, or pattern"),
+    min_confidence: float = Query(None, ge=0, le=1, description="Minimum confidence score")
 ):
     """
-    Get memories with optional filters.
+    Get memories with optional filters and pagination.
     
-    - No filters: Returns ALL memories
-    - agent_id only: Memories for that agent
-    - user_id only: Memories for that user
-    - Both: Memories for specific agent AND user
+    - agent_id/user_id: Scope to specific agent/user
+    - page/limit: Server-side pagination
+    - search: SEMANTIC search using vector embeddings (cosine similarity)
+    - scope: Filter by entity/universal
+    - memory_type: Filter by factual/correction/pattern
+    - min_confidence: Minimum confidence threshold
     """
-    memories = simplemem.vector_store.get_all_entries(agent_id=agent_id, user_id=user_id)
+    # Get filtered and paginated memories from vector store
+    result = simplemem.vector_store.get_entries_paginated(
+        agent_id=agent_id,
+        user_id=user_id,
+        page=page,
+        limit=limit,
+        search=search,
+        scope=scope,
+        memory_type=memory_type,
+        min_confidence=min_confidence
+    )
     
-    return [
+    memories_response = [
         MemoryResponse(
             entry_id=m.entry_id,
             content=m.lossless_restatement,
@@ -831,10 +864,22 @@ async def get_memories(
             source_entity=getattr(m, 'source_entity', None),
             confidence=getattr(m, 'confidence', None),
             agent_id=getattr(m, 'agent_id', None),
-            user_id=getattr(m, 'user_id', None)
+            user_id=getattr(m, 'user_id', None),
+            user_name=getattr(m, 'user_name', None),
+            created_at=getattr(m, 'created_at', None)
         )
-        for m in memories
+        for m in result['memories']
     ]
+    
+    return {
+        "memories": memories_response,
+        "total": result['total'],
+        "page": result['page'],
+        "limit": result['limit'],
+        "totalPages": result['totalPages'],
+        "hasNextPage": result['hasNextPage'],
+        "hasPrevPage": result['hasPrevPage']
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -903,12 +948,14 @@ class TurnInput(BaseModel):
     timestamp: Optional[str] = Field(None, description="ISO 8601 timestamp")
     agent_id: Optional[str] = Field(None, description="Agent identifier")
     user_id: Optional[str] = Field(None, description="User identifier")
+    user_name: Optional[str] = Field(None, description="Human-readable user name")
     process_now: bool = Field(False, description="Force immediate processing after this turn")
     
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "agent_id": "sql_agent",
             "user_id": "user123",
+            "user_name": "John Doe",
             "speaker": "user",
             "content": "Show me Q4 revenue",
             "process_now": False
@@ -920,6 +967,7 @@ class SessionKey(BaseModel):
     """Session identifier."""
     agent_id: Optional[str] = Field(None, description="Agent identifier")
     user_id: Optional[str] = Field(None, description="User identifier")
+    user_name: Optional[str] = Field(None, description="Human-readable user name")
 
 
 @app.post("/session/turn", tags=["Real-Time Session"])
@@ -984,6 +1032,7 @@ async def add_session_turn(input: TurnInput):
     result = session_manager.add_turn(
         agent_id=input.agent_id,
         user_id=input.user_id,
+        user_name=input.user_name,
         speaker=input.speaker,
         content=input.content,
         timestamp=input.timestamp,

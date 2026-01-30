@@ -64,6 +64,7 @@ class AgentMemory:
         self, 
         agent_id: str = None, 
         user_id: str = None, 
+        user_name: str = None,
         clear_db: bool = False,
         enable_deep_analysis: bool = False
     ):
@@ -73,11 +74,13 @@ class AgentMemory:
         Args:
             agent_id: Unique identifier for this agent (e.g., "sql_agent")
             user_id: Optional user identifier for user-specific memories
+            user_name: Optional human-readable user name for display purposes
             clear_db: If True, clears ALL memories (use carefully!)
             enable_deep_analysis: If True, use LLM planning/reflection (slower but better for complex queries)
         """
         self.agent_id = agent_id
         self.user_id = user_id
+        self.user_name = user_name
         self.enable_deep_analysis = enable_deep_analysis
         
         # Use shared components (not new instances each time!)
@@ -91,7 +94,8 @@ class AgentMemory:
             llm_client=self.llm_client,
             vector_store=self.vector_store,
             agent_id=agent_id,
-            user_id=user_id
+            user_id=user_id,
+            user_name=user_name
         )
         
         # Create wrapped retriever that filters by agent/user
@@ -135,9 +139,9 @@ class AgentMemory:
         
         For non-blocking, use finalize_async() instead.
         """
-        logger.info(f"[AgentMemory] Finalizing for agent={self.agent_id}, user={self.user_id}")
+        logger.info(f"[AgentMemory] Finalizing for agent={self.agent_id}, user={self.user_id}, user_name={self.user_name}")
         before = self.vector_store.count_rows()
-        self.memory_builder.process_remaining(agent_id=self.agent_id, user_id=self.user_id)
+        self.memory_builder.process_remaining(agent_id=self.agent_id, user_id=self.user_id, user_name=self.user_name)
         after = self.vector_store.count_rows()
         created = after - before
         logger.info(f"[AgentMemory] Finalized: {created} memories created (total in DB: {after})")
@@ -155,7 +159,7 @@ class AgentMemory:
         def _background_finalize():
             try:
                 logger.info(f"[AgentMemory] Background finalize starting for agent={self.agent_id}")
-                self.memory_builder.process_remaining(agent_id=self.agent_id, user_id=self.user_id)
+                self.memory_builder.process_remaining(agent_id=self.agent_id, user_id=self.user_id, user_name=self.user_name)
                 logger.info(f"[AgentMemory] Background finalize complete")
             except Exception as e:
                 logger.error(f"[Background Finalize] Error: {e}")
@@ -207,7 +211,8 @@ class AgentMemory:
             timestamp=datetime.now().isoformat(),
             topic=category,
             agent_id=self.agent_id,
-            user_id=self.user_id
+            user_id=self.user_id,
+            user_name=self.user_name
         )
         
         self.vector_store.add_entries([entry])
@@ -230,13 +235,14 @@ class AgentMemory:
 
 
 class _AgentMemoryBuilder(MemoryBuilder):
-    """Extended MemoryBuilder that adds agent_id/user_id to entries and deduplicates."""
+    """Extended MemoryBuilder that adds agent_id/user_id/user_name to entries and deduplicates."""
     
-    def __init__(self, llm_client, vector_store, agent_id: str, user_id: str = None, 
+    def __init__(self, llm_client, vector_store, agent_id: str, user_id: str = None, user_name: str = None,
                  deduplicate: bool = True, similarity_threshold: float = 0.85, **kwargs):
         super().__init__(llm_client, vector_store, **kwargs)
         self.agent_id = agent_id
         self.user_id = user_id
+        self.user_name = user_name
         self.deduplicate = deduplicate
         self.similarity_threshold = similarity_threshold
     
@@ -267,18 +273,20 @@ class _AgentMemoryBuilder(MemoryBuilder):
         for i, entry in enumerate(entries):
             logger.info(f"  +-- Memory Entry {i+1}/{len(entries)} ---------------------------")
             logger.info(f"  | Fact: {entry.lossless_restatement}")
+            logger.info(f"  | Type: {entry.memory_type} | Scope: {entry.scope} | Confidence: {entry.confidence}")
             logger.info(f"  | Keywords: {entry.keywords}")
             logger.info(f"  | Persons: {entry.persons}")
             logger.info(f"  | Entities: {entry.entities}")
             logger.info(f"  | Topic: {entry.topic}")
             logger.info(f"  +---------------------------------------------------------------")
         
-        # Add agent_id and user_id to each entry
+        # Add agent_id, user_id, and user_name to each entry
         for entry in entries:
             entry.agent_id = self.agent_id
             entry.user_id = self.user_id
+            entry.user_name = self.user_name
         
-        logger.info(f"  Tagged with agent_id={self.agent_id}, user_id={self.user_id}")
+        logger.info(f"  Tagged with agent_id={self.agent_id}, user_id={self.user_id}, user_name={self.user_name}")
         
         # Deduplicate: check if similar content already exists
         if self.deduplicate and entries:

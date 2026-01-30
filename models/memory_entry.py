@@ -11,10 +11,11 @@ import uuid
 import hashlib
 
 
-def _generate_content_hash(lossless_restatement: str, agent_id: str = None, user_id: str = None) -> str:
+def _generate_content_hash(lossless_restatement: str, agent_id: str = None, user_id: str = None, user_name: str = None) -> str:
     """
     Generate deterministic entry_id from content hash.
     Same content + agent + user = same entry_id for deduplication.
+    Note: user_name is NOT included in hash - only user_id matters for isolation.
     """
     content = f"{lossless_restatement}|{agent_id or ''}|{user_id or ''}"
     return hashlib.sha256(content.encode('utf-8')).hexdigest()[:32]
@@ -97,6 +98,16 @@ class MemoryEntry(BaseModel):
     user_id: Optional[str] = Field(
         None,
         description="User identifier for multi-user isolation"
+    )
+    user_name: Optional[str] = Field(
+        None,
+        description="Human-readable user name for display purposes"
+    )
+    
+    # Database timestamp (when entry was created)
+    created_at: Optional[str] = Field(
+        None,
+        description="ISO 8601 timestamp of when the memory was stored in the database"
     )
 
     @model_validator(mode='after')

@@ -234,9 +234,12 @@ class LLMClient:
                 })
         
         # Append JSON instruction to system prompt if JSON mode requested
-        # This mimics OpenAI's response_format={"type": "json_object"} behavior
+        # Nova needs explicit instructions to return all required JSON fields
         if request_json:
-            json_instruction = "\n\nIMPORTANT: You must respond with valid JSON only. No markdown, no explanation, just pure JSON."
+            json_instruction = """
+
+You must respond with ONLY valid JSON. No markdown code blocks. No explanation text.
+Start your response with [ or { and end with ] or }."""
             system_prompt = (system_prompt + json_instruction) if system_prompt else json_instruction.strip()
         
         body = {
