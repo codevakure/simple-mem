@@ -238,7 +238,7 @@ class _AgentMemoryBuilder(MemoryBuilder):
     """Extended MemoryBuilder that adds agent_id/user_id/user_name to entries and deduplicates."""
     
     def __init__(self, llm_client, vector_store, agent_id: str, user_id: str = None, user_name: str = None,
-                 deduplicate: bool = True, similarity_threshold: float = 0.85, **kwargs):
+                 deduplicate: bool = True, similarity_threshold: float = 0.75, **kwargs):
         super().__init__(llm_client, vector_store, **kwargs)
         self.agent_id = agent_id
         self.user_id = user_id
@@ -280,13 +280,17 @@ class _AgentMemoryBuilder(MemoryBuilder):
             logger.info(f"  | Topic: {entry.topic}")
             logger.info(f"  +---------------------------------------------------------------")
         
-        # Add agent_id, user_id, and user_name to each entry
+        # Add metadata from API layer (not LLM) - we know this from the request
+        from datetime import datetime
+        current_timestamp = datetime.now().isoformat()
+        
         for entry in entries:
             entry.agent_id = self.agent_id
             entry.user_id = self.user_id
             entry.user_name = self.user_name
+            entry.created_at = current_timestamp  # Set timestamp at storage time
         
-        logger.info(f"  Tagged with agent_id={self.agent_id}, user_id={self.user_id}, user_name={self.user_name}")
+        logger.info(f"  Tagged with agent_id={self.agent_id}, user_id={self.user_id}, user_name={self.user_name}, created_at={current_timestamp}")
         
         # Deduplicate: check if similar content already exists
         if self.deduplicate and entries:
@@ -301,21 +305,19 @@ class _AgentMemoryBuilder(MemoryBuilder):
             logger.info(f"  [{i+1}] {entry.lossless_restatement[:80]}...")
         
         return entries
-        
-        return entries
     
     def _deduplicate_entries(self, new_entries: List[MemoryEntry]) -> List[MemoryEntry]:
-        """Remove entries that are too similar to existing ones using embedding similarity.
+        """Remove entries that are too similar to existing ones in the database.
         
         Dedup checks at AGENT level (not user level) - shared knowledge.
         If john says "Use sales_data" and jane says the same, only first is stored.
         """
+        import numpy as np
         unique_entries = []
         
         for entry in new_entries:
-            # Quick semantic search to find similar existing entries
-            # Note: agent_id only (no user_id) for shared agent knowledge
             try:
+                # Check: Is this similar to something already in the database?
                 similar = self.vector_store.semantic_search(
                     entry.lossless_restatement,
                     top_k=3,
@@ -323,28 +325,25 @@ class _AgentMemoryBuilder(MemoryBuilder):
                     user_id=None  # Agent-level dedup (shared knowledge)
                 )
                 
-                # Check if any existing entry is too similar using embedding similarity
                 is_duplicate = False
                 if similar:
-                    # Get embeddings for comparison
+                    # Get embedding for this entry
                     new_embedding = self.vector_store.embedding_model.encode_single(
                         entry.lossless_restatement, is_query=False
                     )
                     
                     for existing in similar:
-                        # Get existing entry's embedding via another search (it's in the DB)
                         existing_embedding = self.vector_store.embedding_model.encode_single(
                             existing.lossless_restatement, is_query=False
                         )
                         
                         # Cosine similarity
-                        import numpy as np
                         similarity = np.dot(new_embedding, existing_embedding) / (
                             np.linalg.norm(new_embedding) * np.linalg.norm(existing_embedding)
                         )
                         
                         if similarity > self.similarity_threshold:
-                            logger.debug(f"[Dedup] Skipping duplicate (sim={similarity:.3f}): {entry.lossless_restatement[:60]}...")
+                            logger.info(f"[Dedup] Skipping duplicate (sim={similarity:.3f}): {entry.lossless_restatement[:60]}...")
                             is_duplicate = True
                             break
                 

@@ -369,7 +369,7 @@ class LanceDBVectorStore:
                 filters.append(f"user_id = '{user_id}'")
             if scope and scope in ['entity', 'universal']:
                 filters.append(f"scope = '{scope}'")
-            if memory_type and memory_type in ['correction', 'feedback', 'insight', 'pattern', 'preference']:
+            if memory_type and memory_type in ['correction', 'feedback', 'pattern', 'preference']:
                 filters.append(f"memory_type = '{memory_type}'")
             if min_confidence is not None:
                 filters.append(f"confidence >= {min_confidence}")
@@ -1167,7 +1167,7 @@ class PgVectorStore:
             limit: Results per page
             search: SEMANTIC search using vector similarity (not just text)
             scope: Filter by scope (entity/universal)
-            memory_type: Filter by type (correction/feedback/insight/pattern/preference)
+            memory_type: Filter by type (correction/feedback/pattern/preference)
             min_confidence: Minimum confidence threshold
             
         Returns:
@@ -1188,7 +1188,7 @@ class PgVectorStore:
             if scope and scope in ['entity', 'universal']:
                 conditions.append("scope = %s")
                 params.append(scope)
-            if memory_type and memory_type in ['correction', 'feedback', 'insight', 'pattern', 'preference']:
+            if memory_type and memory_type in ['correction', 'feedback', 'pattern', 'preference']:
                 conditions.append("memory_type = %s")
                 params.append(memory_type)
             if min_confidence is not None:

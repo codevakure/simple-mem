@@ -27,18 +27,18 @@ def filter_for_storage(entries: List[MemoryEntry]) -> List[MemoryEntry]:
     Filter entries before storing to database.
     
     Stores valuable memory types:
-    - correction: User corrections (highest value, confidence=1.0)
-    - feedback: Explicit UI feedback/ratings (confidence=1.0)
-    - insight: Agent learnings/acknowledgments (confidence=0.9)
-    - pattern: Error/success patterns from tools (confidence=0.8)
-    - preference: User preferences about behavior (confidence=0.7)
+    - correction: User corrections (confidence=1.0)
+    - feedback: Explicit UI ratings (confidence=1.0)
+    - pattern: Tool failures/successes with actionable lesson (confidence=0.9)
+    - preference: User preferences about behavior (confidence=0.8)
     
     Skips:
     - factual: Volatile tool call data (raw query results, etc.)
+    - insight: Merged into pattern (pattern now includes actionable guidance)
     
     This keeps the database focused on stable, valuable memories.
     """
-    stored_types = {'correction', 'feedback', 'insight', 'pattern', 'preference'}
+    stored_types = {'correction', 'feedback', 'pattern', 'preference'}
     
     filtered = [e for e in entries if e.memory_type in stored_types]
     skipped = len(entries) - len(filtered)
@@ -364,36 +364,33 @@ Extract ALL learnable memories from the conversation. Be thorough - capture ever
 </task>
 
 <memory_types>
-1. CORRECTION (confidence=1.0) - User corrected or criticized the agent
-   MUST include: What agent did wrong + Why it was wrong + What to do instead
-   Look for: "No", "Wrong", "Actually", "That's not right", "Why did you", "Don't do", "Stop", "Use X instead"
+1. CORRECTION (confidence=1.0) - User explicitly corrected the agent
+   Source: User message correcting agent behavior
+   Include: What agent did wrong + Why + What to do instead
+   Look for: "No", "Wrong", "Actually", "Why did you", "Don't", "Use X instead"
 
-2. FEEDBACK (confidence=1.0) - Explicit user rating/feedback on agent response
-   Include: What was rated, why it was good/bad, thumbs up/down context
-   Look for: [FEEDBACK], thumbs_up, thumbs_down, rating, "this is good", "this is bad", "helpful", "not helpful"
+2. FEEDBACK (confidence=1.0) - User gave explicit rating
+   Source: UI thumbs up/down or explicit rating
+   Look for: [FEEDBACK, thumbs_up, thumbs_down
+   IMPORTANT: Messages starting with [FEEDBACK are ALWAYS feedback type!
 
-3. INSIGHT (confidence=0.9) - Agent learned something from the interaction
-   Include: New understanding, better approaches, successful strategies
-   Look for: Agent acknowledging mistake, "I see", "Got it", "You're right", "Thanks for the correction"
+3. PATTERN (confidence=0.9) - Tool failure/success with actionable lesson
+   Source: Tool outputs showing errors or successful results
+   MUST include: What happened + What to do differently
+   Example: "LIMIT causes syntax error. Do NOT use LIMIT in this database."
+   Look for: Error messages, retries, successful results after changes
 
-4. PATTERN (confidence=0.8) - Error or success patterns from tool usage
-   Include: What worked, what failed, how to avoid errors
-   Look for: Error messages, retries, successful queries after failures
-
-5. PREFERENCE (confidence=0.7) - User preferences about how agent should behave
-   Include: Style preferences, format preferences, approach preferences
-   Look for: "I prefer", "Always do X", "Never do Y", "I like when you"
+4. PREFERENCE (confidence=0.8) - User stated behavioral preference
+   Source: User expressing how they want agent to behave
+   Look for: "I prefer", "Always do", "Never do", "I like when"
 </memory_types>
 
 <rules>
-1. Be THOROUGH - extract 3-10 memories from a typical conversation
-2. For CORRECTIONS: Always include the FULL context:
-   - WHAT the agent did wrong (the actual mistake)
-   - WHY it was wrong (user's explanation or implicit reason)
-   - WHAT to do instead (the correct approach)
-3. Don't combine unrelated learnings - one memory per distinct learning
+1. Extract DISTINCT learnings - each memory should capture a unique insight
+2. CONSOLIDATE related learnings - if an error and its fix are the same topic, that's ONE memory
+3. For CORRECTIONS: Include the full context (mistake + why wrong + correct approach)
 4. Include exact quotes from user when they correct or teach
-5. Even if agent acknowledged a correction, still extract it as a learning
+5. Do NOT prefix lossless_restatement with type labels like "CORRECTION:", "PATTERN:", etc. - the memory_type field handles this
 </rules>
 
 <output_format>
@@ -402,9 +399,9 @@ Return ONLY a JSON array. No markdown. No explanation.
 Each object MUST have:
 - lossless_restatement (string): Complete learning with full context
 - keywords (array): 3-5 key terms for search
-- memory_type (string): "correction" | "feedback" | "insight" | "pattern" | "preference"
+- memory_type (string): "correction" | "feedback" | "pattern" | "preference"
 - scope (string): "universal" (applies always) | "entity" (specific context)
-- confidence (number): 1.0 | 0.9 | 0.8 | 0.7
+- confidence (number): 1.0 | 0.9 | 0.8
 - topic (string): Short descriptive topic
 - entities (array): Related entities (tables, tools, names)
 </output_format>
@@ -424,40 +421,22 @@ agent: Success: 42 rows
 <example_output>
 [
   {{
-    "lossless_restatement": "LIMIT clause causes 'syntax error at or near LIMIT' in this database. AVOID: Do not use LIMIT in any query. The error occurred in both COUNT(*) and SELECT * queries when LIMIT was appended.",
+    "lossless_restatement": "LIMIT clause causes 'syntax error at or near LIMIT' in this database. Do NOT use LIMIT in any query - it is not supported. The error appeared in multiple queries until LIMIT was removed.",
     "keywords": ["LIMIT", "syntax error", "PostgreSQL", "avoid"],
     "memory_type": "pattern",
     "scope": "universal",
     "confidence": 0.8,
-    "topic": "SQL LIMIT error pattern",
-    "entities": ["PostgreSQL", "users"]
+    "topic": "SQL LIMIT not supported",
+    "entities": ["PostgreSQL"]
   }},
   {{
-    "lossless_restatement": "CORRECTION: When asked for row count, use SELECT COUNT(*) not SELECT *. MISTAKE: Agent tried to use 'SELECT *' to count rows which is inefficient and wrong. USER SAID: 'why are you doing SELECT * instead of SELECT COUNT(*)'. CORRECT APPROACH: Always use COUNT(*) aggregate function for counting rows.",
-    "keywords": ["COUNT(*)", "SELECT *", "row count", "efficiency", "correction"],
+    "lossless_restatement": "When asked for row count, use SELECT COUNT(*) not SELECT *. Agent incorrectly tried 'SELECT *' to count rows. User corrected: 'why are you doing SELECT * instead of SELECT COUNT(*)'. The correct pattern is SELECT COUNT(*) FROM table_name without LIMIT.",
+    "keywords": ["COUNT(*)", "SELECT *", "row count", "aggregate"],
     "memory_type": "correction",
     "scope": "universal",
     "confidence": 1.0,
     "topic": "Use COUNT(*) for row counts",
     "entities": []
-  }},
-  {{
-    "lossless_restatement": "Agent acknowledged the correction about COUNT(*) vs SELECT*. Agent said 'You're absolutely right - my apologies. Using COUNT(*) is the proper way.' This shows the agent understood the mistake.",
-    "keywords": ["acknowledgment", "COUNT(*)", "learned"],
-    "memory_type": "insight",
-    "scope": "universal",
-    "confidence": 0.9,
-    "topic": "Agent learned COUNT(*) usage",
-    "entities": []
-  }},
-  {{
-    "lossless_restatement": "SELECT COUNT(*) FROM users works correctly in this database (returns 42 rows). This is the successful query pattern after removing LIMIT and using proper aggregate.",
-    "keywords": ["COUNT(*)", "success", "working query"],
-    "memory_type": "pattern",
-    "scope": "universal",
-    "confidence": 0.8,
-    "topic": "SQL COUNT success pattern",
-    "entities": ["users"]
   }}
 ]
 </example_output>
@@ -469,12 +448,8 @@ agent: Success: 42 rows
 </conversation>
 
 <instruction>
-Extract ALL memories from the conversation above. Be thorough:
-- Every user correction → CORRECTION with full context (mistake + why wrong + correct approach)
-- Every explicit rating/feedback → FEEDBACK (thumbs up/down, "good job", "bad answer")
-- Every agent acknowledgment of learning → INSIGHT
-- Every error/success from tools → PATTERN
-- Every user preference stated → PREFERENCE
+Extract memories from the conversation. Each memory should be a distinct learning.
+Categorize: correction (user corrected), feedback (user rated), pattern (tool failure/success), or preference (user stated preference).
 
 Return ONLY a JSON array. Each object needs memory_type, scope, confidence.
 </instruction>

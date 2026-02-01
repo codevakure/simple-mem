@@ -75,7 +75,7 @@ class MemoryEntry(BaseModel):
     # Memory classification for Ranger context
     memory_type: Optional[str] = Field(
         None,
-        description="Type: 'correction' (user corrected), 'feedback' (explicit rating), 'insight' (agent learning), 'pattern' (error/success pattern), 'preference' (user preference)"
+        description="Type: 'correction' (user corrected), 'feedback' (explicit rating), 'pattern' (tool failure/success), 'preference' (user preference)"
     )
     scope: Optional[str] = Field(
         None,
