@@ -124,10 +124,10 @@ class MemoryResponse(BaseModel):
     keywords: List[str] = []
     timestamp: Optional[str] = None
     # Classification fields for Ranger
-    memory_type: Optional[str] = None  # factual, correction, pattern
+    memory_type: Optional[str] = None  # correction, feedback, insight, pattern, preference
     scope: Optional[str] = None  # entity, universal
     source_entity: Optional[str] = None  # provenance for patterns
-    confidence: Optional[float] = None  # 1.0=correction, 0.8=factual, 0.6=pattern
+    confidence: Optional[float] = None  # 1.0=correction/feedback, 0.9=insight, 0.8=pattern, 0.7=preference
     agent_id: Optional[str] = None
     user_id: Optional[str] = None
     user_name: Optional[str] = None  # Human-readable user name
@@ -137,10 +137,10 @@ class MemoryResponse(BaseModel):
 class MemoryResultItem(BaseModel):
     """Individual memory result with classification for Ranger."""
     content: str
-    memory_type: Optional[str] = None  # factual, correction, pattern
+    memory_type: Optional[str] = None  # correction, feedback, insight, pattern, preference
     scope: Optional[str] = None  # entity, universal
     source_entity: Optional[str] = None  # provenance for patterns
-    confidence: Optional[float] = None  # 1.0=correction, 0.8=factual, 0.6=pattern
+    confidence: Optional[float] = None  # 1.0=correction/feedback, 0.9=insight, 0.8=pattern, 0.7=preference
     score: Optional[float] = None  # similarity score
 
 
@@ -828,7 +828,7 @@ async def get_memories(
     limit: int = Query(20, ge=1, le=100, description="Results per page"),
     search: str = Query(None, description="SEMANTIC search using vector similarity (not text search)"),
     scope: str = Query(None, description="Filter by scope: entity or universal"),
-    memory_type: str = Query(None, description="Filter by type: factual, correction, or pattern"),
+    memory_type: str = Query(None, description="Filter by type: correction, feedback, insight, pattern, or preference"),
     min_confidence: float = Query(None, ge=0, le=1, description="Minimum confidence score")
 ):
     """
@@ -838,7 +838,7 @@ async def get_memories(
     - page/limit: Server-side pagination
     - search: SEMANTIC search using vector embeddings (cosine similarity)
     - scope: Filter by entity/universal
-    - memory_type: Filter by factual/correction/pattern
+    - memory_type: Filter by correction/feedback/insight/pattern/preference
     - min_confidence: Minimum confidence threshold
     """
     # Get filtered and paginated memories from vector store

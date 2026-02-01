@@ -26,13 +26,19 @@ def filter_for_storage(entries: List[MemoryEntry]) -> List[MemoryEntry]:
     """
     Filter entries before storing to database.
     
-    Only stores Insights (pattern) and Feedback (correction).
-    Tool call results (factual) are skipped - they're volatile and not useful for agent context.
+    Stores valuable memory types:
+    - correction: User corrections (highest value, confidence=1.0)
+    - feedback: Explicit UI feedback/ratings (confidence=1.0)
+    - insight: Agent learnings/acknowledgments (confidence=0.9)
+    - pattern: Error/success patterns from tools (confidence=0.8)
+    - preference: User preferences about behavior (confidence=0.7)
+    
+    Skips:
+    - factual: Volatile tool call data (raw query results, etc.)
     
     This keeps the database focused on stable, valuable memories.
-    Easy to re-enable factual storage by modifying this filter.
     """
-    stored_types = {'pattern', 'correction'}  # Insights + Feedback only
+    stored_types = {'correction', 'feedback', 'insight', 'pattern', 'preference'}
     
     filtered = [e for e in entries if e.memory_type in stored_types]
     skipped = len(entries) - len(filtered)
@@ -354,84 +360,104 @@ class MemoryBuilder:
         Uses XML tags, simple structure, and clear examples
         """
         return f"""<task>
-Extract memories from the conversation below. Return a JSON array.
+Extract ALL learnable memories from the conversation. Be thorough - capture everything the agent should remember.
 </task>
 
+<memory_types>
+1. CORRECTION (confidence=1.0) - User corrected or criticized the agent
+   MUST include: What agent did wrong + Why it was wrong + What to do instead
+   Look for: "No", "Wrong", "Actually", "That's not right", "Why did you", "Don't do", "Stop", "Use X instead"
+
+2. FEEDBACK (confidence=1.0) - Explicit user rating/feedback on agent response
+   Include: What was rated, why it was good/bad, thumbs up/down context
+   Look for: [FEEDBACK], thumbs_up, thumbs_down, rating, "this is good", "this is bad", "helpful", "not helpful"
+
+3. INSIGHT (confidence=0.9) - Agent learned something from the interaction
+   Include: New understanding, better approaches, successful strategies
+   Look for: Agent acknowledging mistake, "I see", "Got it", "You're right", "Thanks for the correction"
+
+4. PATTERN (confidence=0.8) - Error or success patterns from tool usage
+   Include: What worked, what failed, how to avoid errors
+   Look for: Error messages, retries, successful queries after failures
+
+5. PREFERENCE (confidence=0.7) - User preferences about how agent should behave
+   Include: Style preferences, format preferences, approach preferences
+   Look for: "I prefer", "Always do X", "Never do Y", "I like when you"
+</memory_types>
+
 <rules>
-1. Each memory MUST have these 3 required fields:
-   - memory_type: "correction" OR "pattern" OR "factual"
-   - scope: "universal" OR "entity"
-   - confidence: 1.0 OR 0.8 OR 0.6
-
-2. Use these values:
-   - User corrected agent → memory_type="correction", confidence=1.0
-   - Error or success pattern → memory_type="pattern", confidence=0.8
-   - Data from tools → memory_type="factual", confidence=0.6
-
-3. Include source context: WHY was this learned?
+1. Be THOROUGH - extract 3-10 memories from a typical conversation
+2. For CORRECTIONS: Always include the FULL context:
+   - WHAT the agent did wrong (the actual mistake)
+   - WHY it was wrong (user's explanation or implicit reason)
+   - WHAT to do instead (the correct approach)
+3. Don't combine unrelated learnings - one memory per distinct learning
+4. Include exact quotes from user when they correct or teach
+5. Even if agent acknowledged a correction, still extract it as a learning
 </rules>
 
 <output_format>
 Return ONLY a JSON array. No markdown. No explanation.
-Start with [ and end with ]
 
-Each object must have:
-- lossless_restatement (string): The fact with source context
-- keywords (array): Key terms
-- memory_type (string): "correction" or "pattern" or "factual"
-- scope (string): "universal" or "entity"
-- confidence (number): 1.0 or 0.8 or 0.6
-- topic (string): Short topic
-- entities (array): Related entities
+Each object MUST have:
+- lossless_restatement (string): Complete learning with full context
+- keywords (array): 3-5 key terms for search
+- memory_type (string): "correction" | "feedback" | "insight" | "pattern" | "preference"
+- scope (string): "universal" (applies always) | "entity" (specific context)
+- confidence (number): 1.0 | 0.9 | 0.8 | 0.7
+- topic (string): Short descriptive topic
+- entities (array): Related entities (tables, tools, names)
 </output_format>
 
-<example_input>
-user: What is the payment schedule?
-agent: The payment schedule is Same Day Payment.
-user: No that's wrong. It's Annual Payment.
-</example_input>
+<example_conversation>
+user: Query the database for row count
+agent: Running: SELECT COUNT(*) FROM users LIMIT 10
+agent: Error: syntax error at or near LIMIT
+agent: Let me try SELECT * FROM users
+agent: Error: syntax error at or near LIMIT
+user: why are you doing SELECT * instead of SELECT COUNT(*)
+agent: You're absolutely right - my apologies. Using COUNT(*) is the proper way to get a row count.
+agent: Running: SELECT COUNT(*) FROM users
+agent: Success: 42 rows
+</example_conversation>
 
 <example_output>
 [
   {{
-    "lossless_restatement": "The payment schedule is Annual Payment, not Same Day Payment. (Source: User corrected agent saying 'No that's wrong. It's Annual Payment.')",
-    "keywords": ["payment schedule", "Annual Payment"],
+    "lossless_restatement": "LIMIT clause causes 'syntax error at or near LIMIT' in this database. AVOID: Do not use LIMIT in any query. The error occurred in both COUNT(*) and SELECT * queries when LIMIT was appended.",
+    "keywords": ["LIMIT", "syntax error", "PostgreSQL", "avoid"],
+    "memory_type": "pattern",
+    "scope": "universal",
+    "confidence": 0.8,
+    "topic": "SQL LIMIT error pattern",
+    "entities": ["PostgreSQL", "users"]
+  }},
+  {{
+    "lossless_restatement": "CORRECTION: When asked for row count, use SELECT COUNT(*) not SELECT *. MISTAKE: Agent tried to use 'SELECT *' to count rows which is inefficient and wrong. USER SAID: 'why are you doing SELECT * instead of SELECT COUNT(*)'. CORRECT APPROACH: Always use COUNT(*) aggregate function for counting rows.",
+    "keywords": ["COUNT(*)", "SELECT *", "row count", "efficiency", "correction"],
     "memory_type": "correction",
     "scope": "universal",
     "confidence": 1.0,
-    "topic": "Payment schedule correction",
-    "entities": []
-  }}
-]
-</example_output>
-
-<example_input>
-user: Query the database
-agent: Running: SELECT * FROM users LIMIT 10
-agent: Error: syntax error at or near LIMIT
-agent: Running: SELECT * FROM users
-agent: Success: Found 5 users
-</example_input>
-
-<example_output>
-[
-  {{
-    "lossless_restatement": "LIMIT clause causes 'syntax error at or near LIMIT' in this database. Do not use LIMIT.",
-    "keywords": ["LIMIT", "syntax error", "avoid"],
-    "memory_type": "pattern",
-    "scope": "universal",
-    "confidence": 0.8,
-    "topic": "SQL error pattern",
+    "topic": "Use COUNT(*) for row counts",
     "entities": []
   }},
   {{
-    "lossless_restatement": "SELECT without LIMIT works in this database. Use simple SELECT for queries.",
-    "keywords": ["SELECT", "working query"],
+    "lossless_restatement": "Agent acknowledged the correction about COUNT(*) vs SELECT*. Agent said 'You're absolutely right - my apologies. Using COUNT(*) is the proper way.' This shows the agent understood the mistake.",
+    "keywords": ["acknowledgment", "COUNT(*)", "learned"],
+    "memory_type": "insight",
+    "scope": "universal",
+    "confidence": 0.9,
+    "topic": "Agent learned COUNT(*) usage",
+    "entities": []
+  }},
+  {{
+    "lossless_restatement": "SELECT COUNT(*) FROM users works correctly in this database (returns 42 rows). This is the successful query pattern after removing LIMIT and using proper aggregate.",
+    "keywords": ["COUNT(*)", "success", "working query"],
     "memory_type": "pattern",
     "scope": "universal",
     "confidence": 0.8,
-    "topic": "SQL success pattern",
-    "entities": []
+    "topic": "SQL COUNT success pattern",
+    "entities": ["users"]
   }}
 ]
 </example_output>
@@ -443,8 +469,14 @@ agent: Success: Found 5 users
 </conversation>
 
 <instruction>
-Extract memories from the conversation above. Return ONLY a JSON array.
-Remember: EVERY object needs memory_type, scope, and confidence.
+Extract ALL memories from the conversation above. Be thorough:
+- Every user correction → CORRECTION with full context (mistake + why wrong + correct approach)
+- Every explicit rating/feedback → FEEDBACK (thumbs up/down, "good job", "bad answer")
+- Every agent acknowledgment of learning → INSIGHT
+- Every error/success from tools → PATTERN
+- Every user preference stated → PREFERENCE
+
+Return ONLY a JSON array. Each object needs memory_type, scope, confidence.
 </instruction>
 """
 
