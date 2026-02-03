@@ -360,13 +360,17 @@ class MemoryBuilder:
         Uses XML tags, simple structure, and clear examples
         """
         return f"""<task>
-Extract ALL learnable memories from the conversation. Be thorough - capture everything the agent should remember.
+Extract LEARNABLE memories from the conversation. Focus on user corrections, patterns, and actionable insights.
 </task>
 
 <memory_types>
 1. CORRECTION (confidence=1.0) - User explicitly corrected the agent
    Source: User message correcting agent behavior
-   Include: What agent did wrong + Why + What to do instead
+   MUST include:
+   - What agent did wrong (the mistake)
+   - WHY it was wrong (agent's flawed reasoning or approach)
+   - What to do instead (correct approach)
+   - Document/entity context if correction is specific to one document
    Look for: "No", "Wrong", "Actually", "Why did you", "Don't", "Use X instead"
 
 2. FEEDBACK (confidence=1.0) - User gave explicit rating
@@ -374,72 +378,215 @@ Extract ALL learnable memories from the conversation. Be thorough - capture ever
    Look for: [FEEDBACK, thumbs_up, thumbs_down
    IMPORTANT: Messages starting with [FEEDBACK are ALWAYS feedback type!
 
-3. PATTERN (confidence=0.9) - Tool failure/success with actionable lesson
-   Source: Tool outputs showing errors or successful results
-   MUST include: What happened + What to do differently
-   Example: "LIMIT causes syntax error. Do NOT use LIMIT in this database."
-   Look for: Error messages, retries, successful results after changes
+3. PATTERN (confidence=0.9) - Learned rule, behavior, or requirement
+   Source: Tool errors/retries OR user teaching a rule
+   MUST include: The specific rule and when/how to apply it
+   Examples:
+   - From error: "LIMIT causes syntax error. Do NOT use LIMIT in this database."
+   - From user: "Always check the corrections document before extracting fields."
+   Look for: 
+   - Error messages, exceptions, retries after failures
+   - User teaching: "Always", "Must", "You need to", "Make sure", "Never", "Remember to"
+   DO NOT extract patterns from: successful first-attempt executions, normal tool usage without errors
 
 4. PREFERENCE (confidence=0.8) - User stated behavioral preference
    Source: User expressing how they want agent to behave
-   Look for: "I prefer", "Always do", "Never do", "I like when"
+   Look for: "I prefer", "I like when", "I want you to"
+   Note: Preferences are softer than patterns - they're style choices, not hard rules
 </memory_types>
 
+<scope_rules>
+CRITICAL: Determine scope correctly to avoid hallucination!
+
+scope="entity" when:
+- Correction applies to ONE specific document, loan, account, or record
+- Values are specific to that entity (e.g., "payment_amount should be 585.43" for Loan #12345)
+- Include the entity identifier in source_entity field!
+
+scope="universal" when:
+- Correction applies to ALL documents/entities of this type
+- It's a PROCESS or APPROACH issue, not a specific value
+- Example: "Always check the corrections document before extracting fields"
+
+WRONG: "payment_amount should be 585.43" with scope="universal" (would apply wrong value to other loans!)
+RIGHT: "payment_amount should be 585.43 for Loan #12345" with scope="entity", source_entity="Loan #12345"
+</scope_rules>
+
+<reasoning_capture>
+For CORRECTIONS, capture the agent's flawed reasoning if visible in [Reasoning] or [Thinking] blocks.
+This helps prevent the same mistake on NEW documents.
+
+PRESERVE SPECIFICS - Do NOT over-generalize!
+When extracting corrections:
+- Include SPECIFIC field names (e.g., "change_timing", "payment_amount")
+- Include SPECIFIC wrong values (e.g., "DAILY", "MODIFIED FOLLOWING")
+- Include SPECIFIC correct values (e.g., "A:CHANGE SAME DAY", "S:SAME DAY")
+- If agent lists multiple field corrections, create SEPARATE memories for each
+
+Example of GOOD memory:
+"Field #42 change_timing was extracted as 'DAILY' but should be 'A:CHANGE SAME DAY'. 
+Agent's flawed reasoning: 'Prime rates change daily, so Change Timing = DAILY'.
+User corrected: 'You used the wrong method'. The mistake was assuming industry defaults 
+instead of extracting actual values from the corrections document."
+
+Example of BAD memory (too abstract):
+"The agent made mistakes in field extractions by assuming values instead of extracting actual values."
+(This is useless - doesn't say WHICH fields, WHAT values, or HOW to fix!)
+
+MULTIPLE CORRECTIONS = MULTIPLE MEMORIES:
+If agent admits correcting 5 different fields (#42, #57, #58, #36, #52), extract 5 separate memories 
+with the specific field names, wrong values, and correct values for each.
+</reasoning_capture>
+
+<do_not_extract>
+DO NOT extract memories from:
+- Agent system instructions or guidelines (these are static config, not learnings)
+- Routine successful tool calls without errors (only failures/retries are patterns)
+- Generic agent responses without user feedback
+- Normal conversational flow without corrections
+- Agent thinking/reasoning about its own instructions
+- Formatting guidelines, branding, or identity descriptions
+</do_not_extract>
+
 <rules>
-1. Extract DISTINCT learnings - each memory should capture a unique insight
+1. Extract DISTINCT learnings - each memory should capture a unique insight from USER interaction
 2. CONSOLIDATE related learnings - if an error and its fix are the same topic, that's ONE memory
-3. For CORRECTIONS: Include the full context (mistake + why wrong + correct approach)
+3. For CORRECTIONS: Include the full context (mistake + WHY wrong + correct approach)
 4. Include exact quotes from user when they correct or teach
-5. Do NOT prefix lossless_restatement with type labels like "CORRECTION:", "PATTERN:", etc. - the memory_type field handles this
+5. Do NOT prefix lossless_restatement with type labels like "CORRECTION:", "PATTERN:", etc.
+6. If conversation is routine Q&A without issues, return EMPTY array []
+7. Set scope="entity" and source_entity for document-specific corrections!
+
+STRICT: PRESERVE ALL SPECIFICS - NEVER GENERALIZE!
+8. ALWAYS include specific identifiers: field names, parameter names, variable names, API names
+9. ALWAYS include specific values: the WRONG value AND the CORRECT value with exact text
+10. ALWAYS include entity/document IDs when correction is specific to one entity
+11. If agent lists 5 field corrections, create 5 SEPARATE memories - one per field!
+12. NEVER write vague memories like "agent made mistakes" or "values were wrong"
+    BAD: "The agent made critical mistakes in field extractions"
+    GOOD: "Field #42 change_timing was 'DAILY' but should be 'A:CHANGE SAME DAY'"
+13. Keywords MUST include the specific field/parameter names and values, not generic words
+    BAD: ["mistakes", "extraction", "values"]
+    GOOD: ["change_timing", "DAILY", "A:CHANGE SAME DAY", "Field #42"]
 </rules>
 
 <output_format>
 Return ONLY a JSON array. No markdown. No explanation.
+Return [] if no learnable memories found.
 
 Each object MUST have:
-- lossless_restatement (string): Complete learning with full context
+- lossless_restatement (string): Complete learning with full context and reasoning
 - keywords (array): 3-5 key terms for search
 - memory_type (string): "correction" | "feedback" | "pattern" | "preference"
-- scope (string): "universal" (applies always) | "entity" (specific context)
+- scope (string): "universal" (applies to ALL) | "entity" (specific to one document/record)
+- source_entity (string): For entity scope, the document/loan/record ID this applies to
 - confidence (number): 1.0 | 0.9 | 0.8
 - topic (string): Short descriptive topic
 - entities (array): Related entities (tables, tools, names)
 </output_format>
 
-<example_conversation>
-user: Query the database for row count
-agent: Running: SELECT COUNT(*) FROM users LIMIT 10
-agent: Error: syntax error at or near LIMIT
-agent: Let me try SELECT * FROM users
-agent: Error: syntax error at or near LIMIT
-user: why are you doing SELECT * instead of SELECT COUNT(*)
-agent: You're absolutely right - my apologies. Using COUNT(*) is the proper way to get a row count.
-agent: Running: SELECT COUNT(*) FROM users
-agent: Success: 42 rows
-</example_conversation>
+<example_conversation_1>
+user: Get me the data from the system
+agent: [Reasoning] I'll query with a filter to limit results
+agent: [Tool Call: fetch_data]
+{{"query": "SELECT * FROM items", "limit": 10}}
+agent: [Tool Result: fetch_data]
+Error: 'limit' parameter is not supported
+agent: [Reasoning] The limit parameter caused an error. I should try without it.
+agent: [Tool Call: fetch_data]
+{{"query": "SELECT * FROM items"}}
+agent: [Tool Result: fetch_data]
+{{"items": [...]}}
+agent: Here's the data you requested.
+</example_conversation_1>
 
-<example_output>
+<example_output_1>
 [
   {{
-    "lossless_restatement": "LIMIT clause causes 'syntax error at or near LIMIT' in this database. Do NOT use LIMIT in any query - it is not supported. The error appeared in multiple queries until LIMIT was removed.",
-    "keywords": ["LIMIT", "syntax error", "PostgreSQL", "avoid"],
+    "lossless_restatement": "The 'limit' parameter causes error: 'limit parameter is not supported'. Do NOT use limit parameter - it is not supported in this system.",
+    "keywords": ["limit", "parameter", "not supported", "error"],
     "memory_type": "pattern",
     "scope": "universal",
-    "confidence": 0.8,
-    "topic": "SQL LIMIT not supported",
-    "entities": ["PostgreSQL"]
-  }},
-  {{
-    "lossless_restatement": "When asked for row count, use SELECT COUNT(*) not SELECT *. Agent incorrectly tried 'SELECT *' to count rows. User corrected: 'why are you doing SELECT * instead of SELECT COUNT(*)'. The correct pattern is SELECT COUNT(*) FROM table_name without LIMIT.",
-    "keywords": ["COUNT(*)", "SELECT *", "row count", "aggregate"],
-    "memory_type": "correction",
-    "scope": "universal",
-    "confidence": 1.0,
-    "topic": "Use COUNT(*) for row counts",
+    "source_entity": null,
+    "confidence": 0.9,
+    "topic": "Limit parameter not supported",
     "entities": []
   }}
 ]
-</example_output>
+</example_output_1>
+
+<example_conversation_2>
+user: Process record ID-12345
+agent: [Reasoning] I'll use default values for fields I can't find
+agent: [Tool Call: process_record]
+{{"record_id": "ID-12345", "field_a": "DEFAULT_A", "field_b": "DEFAULT_B"}}
+agent: [Tool Result: process_record]
+{{"field_a": "DEFAULT_A", "field_b": "DEFAULT_B"}}
+agent: field_a = DEFAULT_A, field_b = DEFAULT_B
+user: Wrong! field_a should be VALUE_X and field_b should be VALUE_Y. You used defaults instead of checking the source!
+agent: [Reasoning] I made a mistake - I assumed defaults instead of reading the actual source. For ID-12345, the correct values are VALUE_X and VALUE_Y.
+agent: You're right. field_a = VALUE_X and field_b = VALUE_Y.
+</example_conversation_2>
+
+<example_output_2>
+[
+  {{
+    "lossless_restatement": "For record ID-12345, field_a was set to 'DEFAULT_A' but correct value is 'VALUE_X'. Agent assumed default instead of reading source. User corrected: 'You used defaults instead of checking the source!' This correction is specific to record ID-12345.",
+    "keywords": ["field_a", "DEFAULT_A", "VALUE_X", "ID-12345"],
+    "memory_type": "correction",
+    "scope": "entity",
+    "source_entity": "ID-12345",
+    "confidence": 1.0,
+    "topic": "ID-12345 field_a is VALUE_X",
+    "entities": ["ID-12345", "field_a"]
+  }},
+  {{
+    "lossless_restatement": "For record ID-12345, field_b was set to 'DEFAULT_B' but correct value is 'VALUE_Y'. Agent assumed default instead of reading source. User corrected: 'You used defaults instead of checking the source!' This correction is specific to record ID-12345.",
+    "keywords": ["field_b", "DEFAULT_B", "VALUE_Y", "ID-12345"],
+    "memory_type": "correction",
+    "scope": "entity",
+    "source_entity": "ID-12345",
+    "confidence": 1.0,
+    "topic": "ID-12345 field_b is VALUE_Y",
+    "entities": ["ID-12345", "field_b"]
+  }},
+  {{
+    "lossless_restatement": "Do NOT assume default values for fields. Always check the actual source data. Agent's mistake was using assumptions instead of extraction.",
+    "keywords": ["defaults", "assume", "source", "check"],
+    "memory_type": "pattern",
+    "scope": "universal",
+    "source_entity": null,
+    "confidence": 0.9,
+    "topic": "Check source instead of assuming defaults",
+    "entities": []
+  }}
+]
+</example_output_2>
+
+<example_conversation_3>
+user: Format the output for me
+agent: [Tool Call: format_output]
+{{"style": "compact"}}
+agent: [Tool Result: format_output]
+{{"formatted": "..."}}
+agent: Here's the formatted output.
+user: I prefer detailed format, not compact.
+</example_conversation_3>
+
+<example_output_3>
+[
+  {{
+    "lossless_restatement": "User prefers 'detailed' format instead of 'compact'. User stated: 'I prefer detailed format, not compact.'",
+    "keywords": ["format", "detailed", "compact", "preference"],
+    "memory_type": "preference",
+    "scope": "universal",
+    "source_entity": null,
+    "confidence": 0.8,
+    "topic": "User prefers detailed format",
+    "entities": []
+  }}
+]
+</example_output_3>
 
 {context}
 
@@ -448,8 +595,8 @@ agent: Success: 42 rows
 </conversation>
 
 <instruction>
-Extract memories from the conversation. Each memory should be a distinct learning.
-Categorize: correction (user corrected), feedback (user rated), pattern (tool failure/success), or preference (user stated preference).
+Extract memories from the conversation. Focus on user corrections, explicit feedback, and tool failures.
+Return [] if conversation is routine without issues.
 
 Return ONLY a JSON array. Each object needs memory_type, scope, confidence.
 </instruction>

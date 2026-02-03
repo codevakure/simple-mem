@@ -937,6 +937,29 @@ async def list_users(agent_id: str = Query(None, description="Filter by agent"))
     return get_all_users(agent_id)
 
 
+# ----------------------------------------------------------------------------
+# GET /analytics - Get memory analytics for an agent
+# ----------------------------------------------------------------------------
+@app.get("/analytics", tags=["Admin"])
+async def get_analytics(
+    agent_id: str = Query(None, description="Filter by agent"),
+    user_id: str = Query(None, description="Filter by user")
+):
+    """
+    Get comprehensive memory analytics.
+    
+    Returns:
+    - totalMemories: Total count of memories
+    - byType: Breakdown by memory type (correction, feedback, pattern, preference)
+    - byScope: Breakdown by scope (entity, universal)
+    - byUser: Top 10 users by memory count
+    - byConfidence: Distribution across high/medium/low confidence
+    - recentTrend: Daily memory creation over last 30 days
+    - topKeywords: Most frequent keywords in memories
+    """
+    return simplemem.vector_store.get_analytics(agent_id=agent_id, user_id=user_id)
+
+
 # ============================================================================
 # Real-Time Session Endpoints
 # ============================================================================

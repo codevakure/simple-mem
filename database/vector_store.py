@@ -485,6 +485,129 @@ class LanceDBVectorStore:
         self._init_table()
         print("Database cleared")
 
+    def get_analytics(self, agent_id: str = None, user_id: str = None) -> dict:
+        """
+        Get analytics/statistics for memories.
+        
+        Args:
+            agent_id: Filter by agent (optional)
+            user_id: Filter by user (optional)
+            
+        Returns:
+            Analytics dictionary with counts, breakdowns, trends
+        """
+        try:
+            # Build filter
+            filters = []
+            if agent_id:
+                filters.append(f"agent_id = '{agent_id}'")
+            if user_id:
+                filters.append(f"user_id = '{user_id}'")
+            
+            # Get all matching entries for analytics
+            if filters:
+                filter_str = " AND ".join(filters)
+                results = self.table.search().where(filter_str).limit(100000).to_list()
+            else:
+                results = self.table.to_arrow().to_pylist()
+            
+            if not results:
+                return {
+                    'totalMemories': 0,
+                    'byType': [],
+                    'byScope': [],
+                    'byUser': [],
+                    'byConfidence': {'high': 0, 'medium': 0, 'low': 0},
+                    'recentTrend': [],
+                    'topKeywords': []
+                }
+            
+            # Aggregate by memory_type
+            type_counts = {}
+            scope_counts = {}
+            user_counts = {}
+            confidence_buckets = {'high': 0, 'medium': 0, 'low': 0}
+            date_counts = {}
+            keyword_counts = {}
+            
+            for r in results:
+                # By type
+                mem_type = r.get('memory_type', 'unknown') or 'unknown'
+                type_counts[mem_type] = type_counts.get(mem_type, 0) + 1
+                
+                # By scope
+                scope = r.get('scope', 'unknown') or 'unknown'
+                scope_counts[scope] = scope_counts.get(scope, 0) + 1
+                
+                # By user
+                user = r.get('user_id', 'unknown') or 'unknown'
+                if user != 'unknown':
+                    user_name = r.get('user_name', user)
+                    key = f"{user}|{user_name}"
+                    user_counts[key] = user_counts.get(key, 0) + 1
+                
+                # By confidence
+                conf = r.get('confidence', 0.5) or 0.5
+                if conf >= 0.9:
+                    confidence_buckets['high'] += 1
+                elif conf >= 0.7:
+                    confidence_buckets['medium'] += 1
+                else:
+                    confidence_buckets['low'] += 1
+                
+                # By date (for trend)
+                timestamp = r.get('timestamp', '')
+                if timestamp:
+                    try:
+                        date_key = timestamp[:10]  # YYYY-MM-DD
+                        date_counts[date_key] = date_counts.get(date_key, 0) + 1
+                    except:
+                        pass
+                
+                # Keywords
+                keywords = r.get('keywords', []) or []
+                for kw in keywords:
+                    if kw:
+                        keyword_counts[kw] = keyword_counts.get(kw, 0) + 1
+            
+            # Format results
+            by_type = [{'type': k, 'count': v} for k, v in sorted(type_counts.items(), key=lambda x: -x[1])]
+            by_scope = [{'scope': k, 'count': v} for k, v in sorted(scope_counts.items(), key=lambda x: -x[1])]
+            by_user = [
+                {'userId': k.split('|')[0], 'userName': k.split('|')[1] if '|' in k else k, 'count': v}
+                for k, v in sorted(user_counts.items(), key=lambda x: -x[1])[:10]
+            ]
+            recent_trend = [
+                {'date': k, 'count': v}
+                for k, v in sorted(date_counts.items())[-30:]  # Last 30 days
+            ]
+            top_keywords = [
+                {'keyword': k, 'count': v}
+                for k, v in sorted(keyword_counts.items(), key=lambda x: -x[1])[:20]
+            ]
+            
+            return {
+                'totalMemories': len(results),
+                'byType': by_type,
+                'byScope': by_scope,
+                'byUser': by_user,
+                'byConfidence': confidence_buckets,
+                'recentTrend': recent_trend,
+                'topKeywords': top_keywords
+            }
+        except Exception as e:
+            print(f"Error getting analytics: {e}")
+            return {
+                'totalMemories': 0,
+                'byType': [],
+                'byScope': [],
+                'byUser': [],
+                'byConfidence': {'high': 0, 'medium': 0, 'low': 0},
+                'recentTrend': [],
+                'topKeywords': [],
+                'error': str(e)
+            }
+
 
 class PgVectorStore:
     """
@@ -718,13 +841,15 @@ class PgVectorStore:
         for r in results:
             try:
                 # Convert created_at datetime to ISO string if present
+                # Add 'Z' suffix to indicate UTC so JavaScript parses correctly
                 created_at_str = None
                 if include_ids and len(r) > 15 and r[15]:
                     created_at_val = r[15]
                     if hasattr(created_at_val, 'isoformat'):
-                        created_at_str = created_at_val.isoformat()
+                        # Append 'Z' to indicate UTC timezone
+                        created_at_str = created_at_val.isoformat() + 'Z'
                     else:
-                        created_at_str = str(created_at_val)
+                        created_at_str = str(created_at_val) + 'Z'
                 
                 entry = MemoryEntry(
                     entry_id=r[0],
@@ -1439,6 +1564,136 @@ class PgVectorStore:
                 count = cur.rowcount
                 conn.commit()
             return count
+        finally:
+            self._put_conn(conn)
+
+    def get_analytics(self, agent_id: str = None, user_id: str = None) -> dict:
+        """
+        Get analytics/statistics for memories using efficient SQL aggregations.
+        
+        Args:
+            agent_id: Filter by agent (optional)
+            user_id: Filter by user (optional)
+            
+        Returns:
+            Analytics dictionary with counts, breakdowns, trends
+        """
+        conn = self._get_conn()
+        try:
+            conditions = []
+            params = []
+            
+            if agent_id:
+                conditions.append("agent_id = %s")
+                params.append(agent_id)
+            if user_id:
+                conditions.append("user_id = %s")
+                params.append(user_id)
+            
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            
+            with conn.cursor() as cur:
+                # Total count
+                cur.execute(f"SELECT COUNT(*) FROM {self.table_name} {where_clause}", params)
+                total = cur.fetchone()[0]
+                
+                if total == 0:
+                    return {
+                        'totalMemories': 0,
+                        'byType': [],
+                        'byScope': [],
+                        'byUser': [],
+                        'byConfidence': {'high': 0, 'medium': 0, 'low': 0},
+                        'recentTrend': [],
+                        'topKeywords': []
+                    }
+                
+                # By type
+                cur.execute(f"""
+                    SELECT COALESCE(memory_type, 'unknown') as type, COUNT(*) as count
+                    FROM {self.table_name} {where_clause}
+                    GROUP BY memory_type
+                    ORDER BY count DESC
+                """, params)
+                by_type = [{'type': r[0], 'count': r[1]} for r in cur.fetchall()]
+                
+                # By scope
+                cur.execute(f"""
+                    SELECT COALESCE(scope, 'unknown') as scope, COUNT(*) as count
+                    FROM {self.table_name} {where_clause}
+                    GROUP BY scope
+                    ORDER BY count DESC
+                """, params)
+                by_scope = [{'scope': r[0], 'count': r[1]} for r in cur.fetchall()]
+                
+                # By user (top 10)
+                cur.execute(f"""
+                    SELECT user_id, COALESCE(user_name, user_id) as name, COUNT(*) as count
+                    FROM {self.table_name} {where_clause}
+                    {'AND' if conditions else 'WHERE'} user_id IS NOT NULL
+                    GROUP BY user_id, user_name
+                    ORDER BY count DESC
+                    LIMIT 10
+                """, params)
+                by_user = [{'userId': r[0], 'userName': r[1], 'count': r[2]} for r in cur.fetchall()]
+                
+                # By confidence buckets
+                cur.execute(f"""
+                    SELECT 
+                        SUM(CASE WHEN COALESCE(confidence, 0.5) >= 0.9 THEN 1 ELSE 0 END) as high,
+                        SUM(CASE WHEN COALESCE(confidence, 0.5) >= 0.7 AND COALESCE(confidence, 0.5) < 0.9 THEN 1 ELSE 0 END) as medium,
+                        SUM(CASE WHEN COALESCE(confidence, 0.5) < 0.7 THEN 1 ELSE 0 END) as low
+                    FROM {self.table_name} {where_clause}
+                """, params)
+                conf_row = cur.fetchone()
+                by_confidence = {
+                    'high': conf_row[0] or 0,
+                    'medium': conf_row[1] or 0,
+                    'low': conf_row[2] or 0
+                }
+                
+                # Recent trend (last 30 days)
+                cur.execute(f"""
+                    SELECT DATE(created_at) as date, COUNT(*) as count
+                    FROM {self.table_name} {where_clause}
+                    {'AND' if conditions else 'WHERE'} created_at >= CURRENT_DATE - INTERVAL '30 days'
+                    GROUP BY DATE(created_at)
+                    ORDER BY date
+                """, params)
+                recent_trend = [{'date': str(r[0]), 'count': r[1]} for r in cur.fetchall()]
+                
+                # Top keywords (requires unnesting array)
+                cur.execute(f"""
+                    SELECT kw, COUNT(*) as count
+                    FROM {self.table_name}, UNNEST(keywords) as kw
+                    {where_clause}
+                    GROUP BY kw
+                    ORDER BY count DESC
+                    LIMIT 20
+                """, params)
+                top_keywords = [{'keyword': r[0], 'count': r[1]} for r in cur.fetchall()]
+                
+                return {
+                    'totalMemories': total,
+                    'byType': by_type,
+                    'byScope': by_scope,
+                    'byUser': by_user,
+                    'byConfidence': by_confidence,
+                    'recentTrend': recent_trend,
+                    'topKeywords': top_keywords
+                }
+        except Exception as e:
+            print(f"Error getting analytics: {e}")
+            return {
+                'totalMemories': 0,
+                'byType': [],
+                'byScope': [],
+                'byUser': [],
+                'byConfidence': {'high': 0, 'medium': 0, 'low': 0},
+                'recentTrend': [],
+                'topKeywords': [],
+                'error': str(e)
+            }
         finally:
             self._put_conn(conn)
 
