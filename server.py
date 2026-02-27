@@ -112,7 +112,11 @@ class QueryInput(BaseModel):
 class KnowledgeInput(BaseModel):
     """Directly add knowledge."""
     content: str = Field(..., description="Knowledge to store")
-    category: str = Field("general", description="Category: schema, rule, preference")
+    category: str = Field("general", description="Category: schema, rule, preference, general")
+    memory_type: Optional[str] = Field(None, description="Memory type: correction, pattern, insight, rule, preference, feedback")
+    scope: Optional[str] = Field(None, description="Scope: entity (specific to one entity) or universal (applies broadly)")
+    source_entity: Optional[str] = Field(None, description="For entity-scoped memories, the entity identifier")
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0, description="Confidence score: 1.0=correction, 0.9=pattern/rule, 0.8=preference")
     agent_id: Optional[str] = Field(None, description="Agent identifier (optional)")
     user_id: Optional[str] = Field(None, description="User identifier (optional)")
     user_name: Optional[str] = Field(None, description="Human-readable user name (optional)")
@@ -804,16 +808,37 @@ async def add_knowledge(input: KnowledgeInput):
     """
     Directly add knowledge without conversation flow.
     
-    Use for: schemas, rules, preferences.
+    Use for: corrections, patterns, insights, rules, preferences.
+    
+    Memory types:
+    - **correction**: User corrected the agent (confidence=1.0)
+    - **pattern**: Learned rule from errors/retries (confidence=0.9)  
+    - **insight**: Actionable observation about data/process
+    - **rule**: Hard rule the agent must follow (confidence=0.9)
+    - **preference**: User behavioral preference (confidence=0.8)
+    - **feedback**: Explicit rating/feedback (confidence=1.0)
+    
+    Scope:
+    - **entity**: Applies to one specific entity (set source_entity)
+    - **universal**: Applies broadly across all contexts
     """
     memory = AgentMemory(agent_id=input.agent_id, user_id=input.user_id)
-    entry_id = memory.add_knowledge(input.content, input.category)
+    entry_id = memory.add_knowledge(
+        content=input.content,
+        category=input.category,
+        memory_type=input.memory_type,
+        scope=input.scope,
+        source_entity=input.source_entity,
+        confidence=input.confidence,
+    )
     
     return {
         "status": "stored",
         "entry_id": entry_id,
         "agent_id": input.agent_id,
-        "user_id": input.user_id
+        "user_id": input.user_id,
+        "memory_type": input.memory_type,
+        "scope": input.scope,
     }
 
 

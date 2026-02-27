@@ -196,20 +196,57 @@ class AgentMemory:
         lines = [f"{i}. {m.lossless_restatement}" for i, m in enumerate(memories, 1)]
         return "\n".join(lines)
     
-    def add_knowledge(self, content: str, category: str = "general") -> str:
+    def add_knowledge(
+        self,
+        content: str,
+        category: str = "general",
+        memory_type: str = None,
+        scope: str = None,
+        source_entity: str = None,
+        confidence: float = None,
+    ) -> str:
         """
         Directly add knowledge without conversation flow.
         
-        Use to pre-load schemas, rules, preferences.
+        Use to pre-load corrections, patterns, insights, rules, preferences.
+        
+        Args:
+            content: The knowledge/fact/rule to store
+            category: Category for grouping (general, schema, rule, preference)
+            memory_type: Type classification (correction, pattern, insight, rule, preference, feedback)
+            scope: entity (specific) or universal (broad)
+            source_entity: Entity identifier for entity-scoped memories
+            confidence: Confidence score (1.0=correction/feedback, 0.9=pattern/rule, 0.8=preference)
         """
         entry_id = f"knowledge_{self.agent_id}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        
+        # Auto-assign confidence if memory_type is set but confidence is not
+        if memory_type and confidence is None:
+            confidence_map = {
+                'correction': 1.0,
+                'feedback': 1.0,
+                'pattern': 0.9,
+                'rule': 0.9,
+                'insight': 0.85,
+                'preference': 0.8,
+            }
+            confidence = confidence_map.get(memory_type, 0.8)
+        
+        # Build keywords from category and memory_type
+        keywords = [category, "knowledge"]
+        if memory_type:
+            keywords.append(memory_type)
         
         entry = MemoryEntry(
             entry_id=entry_id,
             lossless_restatement=content,
-            keywords=[category, "knowledge"],
+            keywords=keywords,
             timestamp=datetime.now().isoformat(),
             topic=category,
+            memory_type=memory_type,
+            scope=scope or ("entity" if source_entity else "universal"),
+            source_entity=source_entity,
+            confidence=confidence,
             agent_id=self.agent_id,
             user_id=self.user_id,
             user_name=self.user_name
